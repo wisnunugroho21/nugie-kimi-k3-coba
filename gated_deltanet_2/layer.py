@@ -34,9 +34,9 @@ Two honest deviations from the paper, flagged inline below:
 
 from typing import NamedTuple
 
-import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
+from flax import nnx
 
 from gated_deltanet_2.core import (
     chunkwise_gated_delta_rule_2,
@@ -190,7 +190,7 @@ class ShortConv(nnx.Module):
         """Shared conv core. `conv_state` is the previous (kernel_size-1) inputs used
         as left context, or None on the full/training path (pad with zeros == the
         causal left-pad). Returns (y: [B, L, C], new_state: [B, kernel_size-1, C])."""
-        B, L, C = x.shape
+        B, _, C = x.shape
         kc = self.kernel_size - 1
 
         left = jnp.zeros((B, kc, C), x.dtype) if conv_state is None else conv_state
@@ -225,9 +225,7 @@ class ShortConv(nnx.Module):
                 segment_ids, ((0, 0), (shift, 0)), constant_values=0
             )[:, :L]
             source_exists = jnp.arange(L) >= shift
-            same_segment = (
-                segment_ids == shifted_segments
-            ) & source_exists[None, :]
+            same_segment = (segment_ids == shifted_segments) & source_exists[None, :]
             # Matching endpoint IDs are insufficient if an invalid token or a
             # different segment lies between them. Require the whole convolution
             # window from the source through the current token to be one run.
@@ -237,9 +235,7 @@ class ShortConv(nnx.Module):
                     ((0, 0), (intermediate_shift, 0)),
                     constant_values=0,
                 )[:, :L]
-                same_segment = same_segment & (
-                    segment_ids == intermediate_segments
-                )
+                same_segment = same_segment & (segment_ids == intermediate_segments)
             output = output + (
                 shifted_x
                 * same_segment[..., None]
@@ -283,7 +279,9 @@ class GatedDeltaNet2(nnx.Module):
             or chunk_size < 1
             or conv_size < 1
         ):
-            raise ValueError("GDN-2 dimensions, chunk_size, and conv_size must be positive")
+            raise ValueError(
+                "GDN-2 dimensions, chunk_size, and conv_size must be positive"
+            )
         if num_v_heads is not None and num_v_heads < 1:
             raise ValueError("num_v_heads must be positive or None")
 
@@ -529,15 +527,11 @@ class GatedDeltaNet2(nnx.Module):
             if not jnp.issubdtype(segment_ids.dtype, jnp.integer):
                 raise TypeError("segment_ids must use an integer dtype")
             previous_valid = jnp.pad(valid[:, :-1], ((0, 0), (1, 0)))
-            previous_segment = jnp.pad(
-                segment_ids[:, :-1], ((0, 0), (1, 0))
-            )
+            previous_segment = jnp.pad(segment_ids[:, :-1], ((0, 0), (1, 0)))
             segment_start = valid & (
                 (~previous_valid) | (segment_ids != previous_segment)
             )
-            segment_run = jnp.where(
-                valid, jnp.cumsum(segment_start, axis=1), -1
-            )
+            segment_run = jnp.where(valid, jnp.cumsum(segment_start, axis=1), -1)
         else:
             segment_start = None
             segment_run = None

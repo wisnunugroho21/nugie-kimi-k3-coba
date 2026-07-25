@@ -21,31 +21,31 @@ from multi_latent_attention.moe import LatentMoE
 
 
 def tiny_config(**overrides) -> KimiLinearConfig:
-    values = dict(
-        vocab_size=32,
-        d_model=16,
-        n_layers=2,
-        full_attn_period=2,
-        gdn_num_heads=2,
-        gdn_head_k_dim=4,
-        gdn_head_v_dim=4,
-        gdn_chunk_size=2,
-        gdn_conv_size=2,
-        mla_num_q_heads=2,
-        mla_num_kv_heads=1,
-        mla_head_dim=4,
-        max_seq_len=8,
-        moe_d_ff=12,
-        moe_design_mode="custom",
-        moe_n_routed=4,
-        moe_n_shared=1,
-        moe_top_k=2,
-        moe_n_groups=2,
-        moe_topk_groups=1,
-        moe_latent_dim=4,
-        attnres_mode="block",
-        attnres_block_size=2,
-    )
+    values = {
+        "vocab_size": 32,
+        "d_model": 16,
+        "n_layers": 2,
+        "full_attn_period": 2,
+        "gdn_num_heads": 2,
+        "gdn_head_k_dim": 4,
+        "gdn_head_v_dim": 4,
+        "gdn_chunk_size": 2,
+        "gdn_conv_size": 2,
+        "mla_num_q_heads": 2,
+        "mla_num_kv_heads": 1,
+        "mla_head_dim": 4,
+        "max_seq_len": 8,
+        "moe_d_ff": 12,
+        "moe_design_mode": "custom",
+        "moe_n_routed": 4,
+        "moe_n_shared": 1,
+        "moe_top_k": 2,
+        "moe_n_groups": 2,
+        "moe_topk_groups": 1,
+        "moe_latent_dim": 4,
+        "attnres_mode": "block",
+        "attnres_block_size": 2,
+    }
     values.update(overrides)
     return KimiLinearConfig(**values)
 
@@ -68,26 +68,19 @@ def test_cached_attnres_matches_original_rmsnorm_formulation():
     residual = AttentionResidual(5, rngs=nnx.Rngs(29))
     residual.query[...] = jnp.linspace(-0.4, 0.5, 5)
     residual.key_norm.weight[...] = jnp.linspace(0.7, 1.3, 5)
-    values = [
-        jax.random.normal(jax.random.key(index), (2, 3, 5))
-        for index in range(3)
-    ]
+    values = [jax.random.normal(jax.random.key(index), (2, 3, 5)) for index in range(3)]
     partial = jax.random.normal(jax.random.key(30), (2, 3, 5))
     stacked = jnp.stack((*values, partial), axis=0)
 
     keys = residual.key_norm(stacked).astype(jnp.float32)
-    logits = jnp.einsum(
-        "d,sbtd->sbt", residual.query[...].astype(jnp.float32), keys
-    )
+    logits = jnp.einsum("d,sbtd->sbt", residual.query[...].astype(jnp.float32), keys)
     expected_weights = jax.nn.softmax(logits, axis=0)
     expected = jnp.einsum("sbt,sbtd->btd", expected_weights, stacked)
 
     state = AttentionResidualState.initialize(values[0], eps=residual.key_norm.eps)
     for value in values[1:]:
         state = state.append(value, eps=residual.key_norm.eps)
-    actual, actual_weights = residual(
-        state, partial=partial, return_weights=True
-    )
+    actual, actual_weights = residual(state, partial=partial, return_weights=True)
 
     assert state.values.shape == state.normalized.shape == (3, 2, 3, 5)
     assert jnp.allclose(actual_weights, expected_weights, atol=2e-6, rtol=2e-6)
@@ -95,17 +88,13 @@ def test_cached_attnres_matches_original_rmsnorm_formulation():
 
 
 def test_two_phase_attnres_matches_independent_softmax_and_gradients():
-    residuals = [
-        AttentionResidual(4, rngs=nnx.Rngs(31 + index))
-        for index in range(3)
-    ]
+    residuals = [AttentionResidual(4, rngs=nnx.Rngs(31 + index)) for index in range(3)]
     for index, residual in enumerate(residuals, start=1):
         residual.query[...] = index * jnp.linspace(-0.2, 0.3, 4)
         residual.key_norm.weight[...] = jnp.linspace(0.8, 1.2, 4)
 
     completed = [
-        jax.random.normal(jax.random.key(35 + index), (1, 3, 4))
-        for index in range(3)
+        jax.random.normal(jax.random.key(35 + index), (1, 3, 4)) for index in range(3)
     ]
     partials = [
         None,
@@ -136,28 +125,18 @@ def test_two_phase_attnres_matches_independent_softmax_and_gradients():
     assert jnp.allclose(phased_grad, direct_grad, atol=3e-5, rtol=3e-5)
 
     def direct_source_loss(first_source):
-        return jnp.sum(
-            residuals[1]([first_source, *completed[1:], partials[1]]) ** 2
-        )
+        return jnp.sum(residuals[1]([first_source, *completed[1:], partials[1]]) ** 2)
 
     def phased_source_loss(first_source):
-        current_state = AttentionResidualState.initialize(
-            first_source, eps=1e-5
-        )
+        current_state = AttentionResidualState.initialize(first_source, eps=1e-5)
         for value in completed[1:]:
             current_state = current_state.append(value, eps=1e-5)
-        current_phase = prepare_batched_attention_residual(
-            residuals, current_state
-        )
-        return jnp.sum(
-            residuals[1].merge_phase(current_phase, 1, partials[1]) ** 2
-        )
+        current_phase = prepare_batched_attention_residual(residuals, current_state)
+        return jnp.sum(residuals[1].merge_phase(current_phase, 1, partials[1]) ** 2)
 
     direct_source_grad = jax.grad(direct_source_loss)(completed[0])
     phased_source_grad = jax.grad(phased_source_loss)(completed[0])
-    assert jnp.allclose(
-        phased_source_grad, direct_source_grad, atol=3e-5, rtol=3e-5
-    )
+    assert jnp.allclose(phased_source_grad, direct_source_grad, atol=3e-5, rtol=3e-5)
 
 
 def test_latent_moe_sparse_dispatch_matches_dense_reference():
@@ -214,9 +193,7 @@ def test_latent_moe_design_report_exposes_cost_tradeoff():
     model = KimiLinear(accuracy_config, rngs=nnx.Rngs(28))
     actual_params = sum(
         leaf.size
-        for leaf in jax.tree.leaves(
-            nnx.state(model.layers[0].channel_mixer, nnx.Param)
-        )
+        for leaf in jax.tree.leaves(nnx.state(model.layers[0].channel_mixer, nnx.Param))
     )
 
     assert default.moe_design_mode == "accuracy"
@@ -268,17 +245,20 @@ def _repeated_kv_mla_reference(mla, x, attention_mask, segment_ids):
     valid = attention_mask.astype(bool)
     masked_x = jnp.where(valid[..., None], x, 0)
     batch_size, seq_length, _ = x.shape
-    q = mla.w_q_uk(masked_x).reshape(
-        batch_size, seq_length, mla.num_q_heads, mla.head_dim
-    ).transpose(0, 2, 1, 3)
-    kv = mla.w_dkv(masked_x).reshape(
-        batch_size, seq_length, mla.num_kv_heads, mla.head_dim
-    ).transpose(0, 2, 1, 3)
-    repeated_kv = kv.repeat(mla.group_size, axis=1)
-    logits = (
-        jnp.einsum("bhqd,bhkd->bhqk", q, repeated_kv).astype(jnp.float32)
-        / jnp.sqrt(mla.head_dim)
+    q = (
+        mla.w_q_uk(masked_x)
+        .reshape(batch_size, seq_length, mla.num_q_heads, mla.head_dim)
+        .transpose(0, 2, 1, 3)
     )
+    kv = (
+        mla.w_dkv(masked_x)
+        .reshape(batch_size, seq_length, mla.num_kv_heads, mla.head_dim)
+        .transpose(0, 2, 1, 3)
+    )
+    repeated_kv = kv.repeat(mla.group_size, axis=1)
+    logits = jnp.einsum("bhqd,bhkd->bhqk", q, repeated_kv).astype(
+        jnp.float32
+    ) / jnp.sqrt(mla.head_dim)
     mask = (
         jnp.tril(jnp.ones((seq_length, seq_length), dtype=bool))[None]
         & valid[:, :, None]
@@ -286,9 +266,7 @@ def _repeated_kv_mla_reference(mla, x, attention_mask, segment_ids):
     )
     previous_valid = jnp.pad(valid[:, :-1], ((0, 0), (1, 0)))
     previous_segment = jnp.pad(segment_ids[:, :-1], ((0, 0), (1, 0)))
-    segment_start = valid & (
-        (~previous_valid) | (segment_ids != previous_segment)
-    )
+    segment_start = valid & ((~previous_valid) | (segment_ids != previous_segment))
     segment_run = jnp.cumsum(segment_start, axis=1)
     mask &= segment_run[:, :, None] == segment_run[:, None, :]
     diagonal = jnp.eye(seq_length, dtype=bool)[None]
@@ -296,10 +274,10 @@ def _repeated_kv_mla_reference(mla, x, attention_mask, segment_ids):
     probabilities = jax.nn.softmax(
         jnp.where(mask[:, None], logits, -jnp.inf), axis=-1
     ).astype(repeated_kv.dtype)
-    weighted = jnp.einsum(
-        "bhqk,bhkd->bhqd", probabilities, repeated_kv
-    ).transpose(0, 2, 1, 3).reshape(
-        batch_size, seq_length, mla.num_q_heads * mla.head_dim
+    weighted = (
+        jnp.einsum("bhqk,bhkd->bhqd", probabilities, repeated_kv)
+        .transpose(0, 2, 1, 3)
+        .reshape(batch_size, seq_length, mla.num_q_heads * mla.head_dim)
     )
     output = mla._output(weighted, masked_x)
     return jnp.where(valid[..., None], output, 0)
@@ -315,17 +293,13 @@ def test_mla_chunked_grouped_attention_matches_repeated_kv_reference():
         rngs=nnx.Rngs(101),
     )
     x = jax.random.normal(jax.random.key(102), (2, 5, 12))
-    attention_mask = jnp.array(
-        [[1, 1, 1, 1, 1], [0, 1, 1, 1, 0]], dtype=bool
-    )
+    attention_mask = jnp.array([[1, 1, 1, 1, 1], [0, 1, 1, 1, 0]], dtype=bool)
     # Reusing raw ID 1 after a boundary deliberately exercises contiguous-run
     # canonicalization in addition to query chunk boundaries.
     segment_ids = jnp.array([[1, 1, 2, 2, 1], [9, 1, 1, 2, 2]], jnp.int32)
 
     actual = mla(x, attention_mask, segment_ids)
-    expected = _repeated_kv_mla_reference(
-        mla, x, attention_mask, segment_ids
-    )
+    expected = _repeated_kv_mla_reference(mla, x, attention_mask, segment_ids)
 
     assert jnp.allclose(actual, expected, rtol=1e-5, atol=1e-5)
     gradient = jax.grad(

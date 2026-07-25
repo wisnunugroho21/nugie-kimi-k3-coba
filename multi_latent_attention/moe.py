@@ -27,9 +27,9 @@ traffic per token; it changes WHICH experts are candidates, never the dispatch /
 grouped-GEMM / combine machinery. Set n_groups=1 to disable.
 """
 
-import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
+from flax import nnx
 
 F32 = jnp.float32
 
@@ -76,7 +76,9 @@ class GroupedGemmMoE(nnx.Module):
         rngs: nnx.Rngs,
     ):
         if min(d_model, d_ff, n_routed, n_shared, top_k, n_groups, topk_groups) < 1:
-            raise ValueError("MoE dimensions, expert counts, and routing counts must be positive")
+            raise ValueError(
+                "MoE dimensions, expert counts, and routing counts must be positive"
+            )
         if n_routed % n_groups != 0:
             raise ValueError("n_routed must be divisible by n_groups")
         if topk_groups > n_groups:
@@ -257,16 +259,12 @@ class GroupedGemmMoE(nnx.Module):
         order = jnp.argsort(flat_e)  # group same-expert rows
         sort_tok = flat_tok[order]
         sort_w = flat_w[order]
-        dispatch_group_sizes = jnp.bincount(
-            flat_e, length=self.E
-        )  # [E], sums to T*k
+        dispatch_group_sizes = jnp.bincount(flat_e, length=self.E)  # [E], sums to T*k
 
         x_sorted = zf[sort_tok]  # [M, latent_dim], M = T*k
 
         # ---- grouped GEMM: one matmul per expert over its contiguous rows ----
-        h = jax.lax.ragged_dot(
-            x_sorted, self.w_in.astype(cdtype), dispatch_group_sizes
-        )
+        h = jax.lax.ragged_dot(x_sorted, self.w_in.astype(cdtype), dispatch_group_sizes)
         g_, u_ = jnp.split(h, 2, axis=-1)  # [M, d_ff] each
         a = jax.nn.silu(g_) * u_
         y_sorted = jax.lax.ragged_dot(
@@ -275,9 +273,7 @@ class GroupedGemmMoE(nnx.Module):
 
         # ---- combine: weight, un-permute, sum top-k per token ----
         y_sorted = y_sorted.astype(F32) * sort_w[:, None]
-        routed_latent = jnp.zeros((T, self.expert_dim), F32).at[sort_tok].add(
-            y_sorted
-        )
+        routed_latent = jnp.zeros((T, self.expert_dim), F32).at[sort_tok].add(y_sorted)
         routed = (
             self.latent_up(routed_latent.astype(cdtype)).astype(F32)
             if self.latent_up is not None
@@ -290,9 +286,7 @@ class GroupedGemmMoE(nnx.Module):
 
         # ---- diagnostics for the training loop ----
         assignment_valid = jnp.repeat(valid_flat.astype(F32), k)
-        group_sizes = jnp.bincount(
-            flat_e, weights=assignment_valid, length=self.E
-        )
+        group_sizes = jnp.bincount(flat_e, weights=assignment_valid, length=self.E)
         valid_tokens = valid_flat.astype(F32).sum()
         assignment_count = jnp.maximum(valid_tokens * k, 1.0)
         load = group_sizes.astype(F32) / assignment_count
@@ -303,9 +297,9 @@ class GroupedGemmMoE(nnx.Module):
         # the mean softmax routing probability (this is where the gradient flows).
         # Reuses the logits already computed by _route (no second router matmul).
         token_probs = jax.nn.softmax(router_logits, axis=-1)
-        probs = (
-            token_probs * valid_flat.astype(F32)[:, None]
-        ).sum(0) / jnp.maximum(valid_tokens, 1.0)
+        probs = (token_probs * valid_flat.astype(F32)[:, None]).sum(0) / jnp.maximum(
+            valid_tokens, 1.0
+        )
         aux_loss = self.aux_alpha * self.E * jnp.sum(load * probs)
         aux = {"load": load, "aux_loss": aux_loss, "group_sizes": group_sizes}
         return out, aux

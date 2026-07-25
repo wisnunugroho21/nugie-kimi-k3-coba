@@ -208,9 +208,8 @@ class GroupedQueryLatentAttention(nnx.Module):
         mask: [B, Q, K]. The grouped layout broadcasts each KV head to its
         query-head group without allocating a repeated KV tensor.
         """
-        logits = (
-            jnp.einsum("bhgqd,bhkd->bhgqk", q, l_kv).astype(F32)
-            / jnp.sqrt(self.head_dim)
+        logits = jnp.einsum("bhgqd,bhkd->bhgqk", q, l_kv).astype(F32) / jnp.sqrt(
+            self.head_dim
         )
         expanded_mask = mask[:, None, None, :, :]
         masked_logits = jnp.where(expanded_mask, logits, -jnp.inf)
@@ -268,9 +267,7 @@ class GroupedQueryLatentAttention(nnx.Module):
         key_positions = jnp.arange(seq_length)
         if segment_ids is not None:
             previous_valid = jnp.pad(valid[:, :-1], ((0, 0), (1, 0)))
-            previous_segment = jnp.pad(
-                segment_ids[:, :-1], ((0, 0), (1, 0))
-            )
+            previous_segment = jnp.pad(segment_ids[:, :-1], ((0, 0), (1, 0)))
             segment_start = valid & (
                 (~previous_valid) | (segment_ids != previous_segment)
             )
@@ -292,16 +289,12 @@ class GroupedQueryLatentAttention(nnx.Module):
                 & valid[:, None, :]
             )
             if query_segments is not None:
-                mask = mask & (
-                    query_segments[:, :, None] == segment_run[:, None, :]
-                )
+                mask = mask & (query_segments[:, :, None] == segment_run[:, None, :])
             return self._attend_query_chunk(query_chunk, l_kv_heads, mask)
 
         chunk_size = min(self.query_chunk_size, seq_length)
         if seq_length <= chunk_size:
-            weighted_heads = attend_chunk(
-                q_heads, valid, key_positions, segment_run
-            )
+            weighted_heads = attend_chunk(q_heads, valid, key_positions, segment_run)
         else:
             num_chunks = (seq_length + chunk_size - 1) // chunk_size
             padded_length = num_chunks * chunk_size
@@ -430,9 +423,7 @@ class GroupedQueryLatentAttention(nnx.Module):
         numerator = jnp.zeros(
             (B, self.num_kv_heads, self.group_size, L, self.head_dim), F32
         )
-        denominator = jnp.zeros(
-            (B, self.num_kv_heads, self.group_size, L), F32
-        )
+        denominator = jnp.zeros((B, self.num_kv_heads, self.group_size, L), F32)
         running_max = jnp.full_like(denominator, -jnp.inf)
 
         def page_body(page_index, state):
@@ -454,10 +445,9 @@ class GroupedQueryLatentAttention(nnx.Module):
                     & (key_positions[None, :] < page_end)
                     & (key_positions[None, :] <= q_pos[:, None])
                 )
-                logits = (
-                    jnp.einsum("bhgqd,bhkd->bhgqk", q_heads, page).astype(F32)
-                    / jnp.sqrt(self.head_dim)
-                )
+                logits = jnp.einsum("bhgqd,bhkd->bhgqk", q_heads, page).astype(
+                    F32
+                ) / jnp.sqrt(self.head_dim)
                 expanded_mask = page_mask[None, None, None, :, :]
                 masked_logits = jnp.where(expanded_mask, logits, -jnp.inf)
                 has_page = jnp.any(expanded_mask, axis=-1)
@@ -487,12 +477,9 @@ class GroupedQueryLatentAttention(nnx.Module):
                 current_scale = jnp.where(
                     has_current, jnp.exp(current_max - merged_max), 0.0
                 )
-                page_scale = jnp.where(
-                    has_page, jnp.exp(page_max - merged_max), 0.0
-                )
+                page_scale = jnp.where(has_page, jnp.exp(page_max - merged_max), 0.0)
                 merged_denominator = (
-                    current_scale * current_denominator
-                    + page_scale * page_denominator
+                    current_scale * current_denominator + page_scale * page_denominator
                 )
                 merged_numerator = (
                     current_scale[..., None] * current_numerator

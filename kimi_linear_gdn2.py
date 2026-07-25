@@ -202,9 +202,7 @@ class KimiLinearConfig:
         if self.gdn_num_v_heads is not None and self.gdn_num_v_heads < 1:
             raise ValueError("gdn_num_v_heads must be positive or None")
         gdn_v_heads = (
-            self.gdn_num_heads
-            if self.gdn_num_v_heads is None
-            else self.gdn_num_v_heads
+            self.gdn_num_heads if self.gdn_num_v_heads is None else self.gdn_num_v_heads
         )
         if gdn_v_heads < 1 or gdn_v_heads % self.gdn_num_heads != 0:
             raise ValueError(
@@ -280,31 +278,19 @@ class KimiLinearConfig:
 
         routed_params = 3 * actual_n * latent * self.moe_d_ff
         projection_params = (
-            0
-            if self.moe_latent_dim is None
-            else 2 * self.d_model * latent
+            0 if self.moe_latent_dim is None else 2 * self.d_model * latent
         )
         router_params = self.d_model * actual_n
-        shared_params = (
-            3 * self.d_model * self.moe_d_ff * self.moe_n_shared
-        )
-        total_params = (
-            routed_params + projection_params + router_params + shared_params
-        )
+        shared_params = 3 * self.d_model * self.moe_d_ff * self.moe_n_shared
+        total_params = routed_params + projection_params + router_params + shared_params
 
         routed_flops = 6 * actual_k * latent * self.moe_d_ff
         projection_flops = (
-            0
-            if self.moe_latent_dim is None
-            else 4 * self.d_model * latent
+            0 if self.moe_latent_dim is None else 4 * self.d_model * latent
         )
         router_flops = 2 * self.d_model * actual_n
-        shared_flops = (
-            6 * self.d_model * self.moe_d_ff * self.moe_n_shared
-        )
-        total_flops = (
-            routed_flops + projection_flops + router_flops + shared_flops
-        )
+        shared_flops = 6 * self.d_model * self.moe_d_ff * self.moe_n_shared
+        total_flops = routed_flops + projection_flops + router_flops + shared_flops
 
         baseline_params = (
             3 * self.moe_n_routed * self.d_model * self.moe_d_ff
@@ -535,7 +521,9 @@ class KimiLinear(nnx.Module):
         if input_ids.shape[0] < 1 or input_ids.shape[1] < 1:
             raise ValueError("input_ids batch and sequence dimensions must be non-zero")
         if not jnp.issubdtype(input_ids.dtype, jnp.integer):
-            raise TypeError(f"input_ids must use an integer dtype, got {input_ids.dtype}")
+            raise TypeError(
+                f"input_ids must use an integer dtype, got {input_ids.dtype}"
+            )
         if max_len is not None and input_ids.shape[1] > max_len:
             raise ValueError(
                 f"Sequence length {input_ids.shape[1]} exceeds max_seq_len {max_len}"
@@ -563,17 +551,13 @@ class KimiLinear(nnx.Module):
         def run_token(layer_index: int, layer: DecoderLayer, h: jax.Array):
             if streaming:
                 assert caches is not None
-                delta, new_cache = layer.stream_token_delta(
-                    h, caches[layer_index]
-                )
+                delta, new_cache = layer.stream_token_delta(h, caches[layer_index])
                 new_caches.append(new_cache)
                 return delta
             return layer.token_delta(h, attention_mask, segment_ids)
 
         if self.cfg.attnres_mode == "full":
-            sources = AttentionResidualState.initialize(
-                x, eps=self.cfg.rms_eps
-            )
+            sources = AttentionResidualState.initialize(x, eps=self.cfg.rms_eps)
             for layer_index, layer in enumerate(self.layers):
                 assert layer.token_residual is not None
                 assert layer.channel_residual is not None
@@ -599,9 +583,7 @@ class KimiLinear(nnx.Module):
         if self.cfg.attnres_mode != "block":
             raise ValueError("_run_attention_residuals requires full or block mode")
 
-        completed = AttentionResidualState.initialize(
-            x, eps=self.cfg.rms_eps
-        )
+        completed = AttentionResidualState.initialize(x, eps=self.cfg.rms_eps)
         partial = None
         sublayer_index = 0
         ordered_residuals = [
@@ -632,9 +614,7 @@ class KimiLinear(nnx.Module):
                         ordered_residuals[phase_start:phase_end], completed
                     )
                 assert phase is not None
-                h = residual.merge_phase(
-                    phase, sublayer_index - phase_start, partial
-                )
+                h = residual.merge_phase(phase, sublayer_index - phase_start, partial)
 
                 if is_token:
                     delta = run_token(layer_index, layer, h)
@@ -646,9 +626,7 @@ class KimiLinear(nnx.Module):
                 partial = delta if partial is None else partial + delta
                 sublayer_index += 1
                 if sublayer_index % self.cfg.attnres_block_size == 0:
-                    completed = completed.append(
-                        partial, eps=self.cfg.rms_eps
-                    )
+                    completed = completed.append(partial, eps=self.cfg.rms_eps)
                     partial = None
 
         if partial is not None:
@@ -761,9 +739,7 @@ class KimiLinear(nnx.Module):
                 x, new_cache = layer.step(x, cache)
                 new_caches.append(new_cache)
         else:
-            x, _, _, new_caches = self._run_attention_residuals(
-                x, caches=caches
-            )
+            x, _, _, new_caches = self._run_attention_residuals(x, caches=caches)
 
         x = self.norm_f(x)
         return self.lm_head(x).astype(jnp.float32), new_caches

@@ -48,14 +48,14 @@ class AttentionResidualState(NamedTuple):
     normalized: jax.Array  # [S, B, T, D]
 
     @classmethod
-    def initialize(cls, value: jax.Array, *, eps: float) -> "AttentionResidualState":
+    def initialize(cls, value: jax.Array, *, eps: float) -> AttentionResidualState:
         if value.ndim != 3:
             raise ValueError(
                 f"AttnRes source must have shape [batch, length, d_model], got {value.shape}"
             )
         return cls(value[None], _normalize_source(value, eps)[None])
 
-    def append(self, value: jax.Array, *, eps: float) -> "AttentionResidualState":
+    def append(self, value: jax.Array, *, eps: float) -> AttentionResidualState:
         if value.shape != self.values.shape[1:]:
             raise ValueError(
                 f"AttnRes source must have shape {self.values.shape[1:]}, got {value.shape}"
@@ -131,13 +131,10 @@ class AttentionResidual(nnx.Module):
                 axis=0,
             )
 
-        effective_query = (
-            self.query[...].astype(F32)
-            * self.key_norm.weight[...].astype(F32)
-        )
-        logits = jnp.einsum(
-            "d,sbtd->sbt", effective_query, normalized.astype(F32)
-        )
+        effective_query = self.query[...].astype(F32) * self.key_norm.weight[
+            ...
+        ].astype(F32)
+        logits = jnp.einsum("d,sbtd->sbt", effective_query, normalized.astype(F32))
         weights = jax.nn.softmax(logits, axis=0)
         output = jnp.einsum("sbt,sbtd->btd", weights.astype(stacked.dtype), stacked)
         if return_weights:
@@ -157,23 +154,19 @@ class AttentionResidual(nnx.Module):
         if partial is None:
             return (numerator / denominator[..., None]).astype(phase.output_dtype)
 
-        effective_query = (
-            self.query[...].astype(F32)
-            * self.key_norm.weight[...].astype(F32)
-        )
+        effective_query = self.query[...].astype(F32) * self.key_norm.weight[
+            ...
+        ].astype(F32)
         partial_key = _normalize_source(partial, self.key_norm.eps).astype(F32)
         partial_score = jnp.einsum("d,btd->bt", effective_query, partial_key)
 
-        merged_max = jax.lax.stop_gradient(
-            jnp.maximum(maximum, partial_score)
-        )
+        merged_max = jax.lax.stop_gradient(jnp.maximum(maximum, partial_score))
         inter_scale = jnp.exp(maximum - merged_max)
         partial_scale = jnp.exp(partial_score - merged_max)
         merged_denominator = inter_scale * denominator + partial_scale
-        merged_numerator = (
-            inter_scale[..., None] * numerator
-            + partial_scale[..., None] * partial.astype(F32)
-        )
+        merged_numerator = inter_scale[..., None] * numerator + partial_scale[
+            ..., None
+        ] * partial.astype(F32)
         return (merged_numerator / merged_denominator[..., None]).astype(
             phase.output_dtype
         )
@@ -188,8 +181,7 @@ def prepare_batched_attention_residual(
         raise ValueError("At least one AttentionResidual query is required")
     effective_queries = jnp.stack(
         tuple(
-            residual.query[...].astype(F32)
-            * residual.key_norm.weight[...].astype(F32)
+            residual.query[...].astype(F32) * residual.key_norm.weight[...].astype(F32)
             for residual in residuals
         ),
         axis=0,
@@ -200,9 +192,7 @@ def prepare_batched_attention_residual(
     maximum = jax.lax.stop_gradient(jnp.max(logits, axis=1))
     unnormalized = jnp.exp(logits - maximum[:, None])
     denominator = jnp.sum(unnormalized, axis=1)
-    numerator = jnp.einsum(
-        "qsbt,sbtd->qbtd", unnormalized, sources.values.astype(F32)
-    )
+    numerator = jnp.einsum("qsbt,sbtd->qbtd", unnormalized, sources.values.astype(F32))
     return AttentionResidualPhase(
         numerator=numerator,
         max_score=maximum,
