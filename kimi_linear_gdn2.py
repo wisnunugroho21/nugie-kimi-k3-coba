@@ -58,7 +58,11 @@ import jax.numpy as jnp
 from flax import nnx
 from jax.typing import ArrayLike
 
-from attention_residual import AttentionResidual
+from attention_residual import (
+    AttentionResidual,
+    AttentionResidualState,
+    prepare_batched_attention_residual,
+)
 
 # Reuse the building blocks already implemented and verified in this repo.
 from gated_deltanet_2.layer import GatedDeltaNet2, GDN2Cache, RMSNorm
@@ -529,6 +533,126 @@ class KimiLinear(nnx.Module):
                 f"Sequence length {input_ids.shape[1]} exceeds max_seq_len {max_len}"
             )
 
+    def _run_attention_residuals(
+        self,
+        x: jax.Array,
+        *,
+        attention_mask: jax.Array | None = None,
+        segment_ids: jax.Array | None = None,
+        caches: list | None = None,
+    ) -> tuple[jax.Array, ArrayLike, list[ArrayLike], list]:
+        """Shared training/streaming AttnRes topology.
+
+        Full mode caches normalized depth sources once. Block mode additionally
+        batches every pseudo-query in a block over completed block summaries, then
+        online-softmax merges the evolving intra-block partial source.
+        """
+        streaming = caches is not None
+        new_caches = []
+        aux_loss: ArrayLike = 0.0
+        group_sizes: list[ArrayLike] = []
+
+        def run_token(layer_index: int, layer: DecoderLayer, h: jax.Array):
+            if streaming:
+                assert caches is not None
+                delta, new_cache = layer.stream_token_delta(
+                    h, caches[layer_index]
+                )
+                new_caches.append(new_cache)
+                return delta
+            return layer.token_delta(h, attention_mask, segment_ids)
+
+        if self.cfg.attnres_mode == "full":
+            sources = AttentionResidualState.initialize(
+                x, eps=self.cfg.rms_eps
+            )
+            for layer_index, layer in enumerate(self.layers):
+                assert layer.token_residual is not None
+                assert layer.channel_residual is not None
+
+                h = layer.token_residual(sources)
+                delta = run_token(layer_index, layer, h)
+                sources = sources.append(delta, eps=self.cfg.rms_eps)
+
+                h = layer.channel_residual(sources)
+                delta, aux = layer.channel_delta(h, attention_mask)
+                sources = sources.append(delta, eps=self.cfg.rms_eps)
+                aux_loss = aux_loss + aux["aux_loss"]
+                group_sizes.append(aux["group_sizes"])
+
+            assert self.final_residual is not None
+            return (
+                self.final_residual(sources),
+                aux_loss,
+                group_sizes,
+                new_caches,
+            )
+
+        if self.cfg.attnres_mode != "block":
+            raise ValueError("_run_attention_residuals requires full or block mode")
+
+        completed = AttentionResidualState.initialize(
+            x, eps=self.cfg.rms_eps
+        )
+        partial = None
+        sublayer_index = 0
+        ordered_residuals = [
+            residual
+            for layer in self.layers
+            for residual in (layer.token_residual, layer.channel_residual)
+        ]
+        if any(residual is None for residual in ordered_residuals):
+            raise ValueError("Block AttnRes layer is missing a residual module")
+
+        phase = None
+        phase_start = 0
+        for layer_index, layer in enumerate(self.layers):
+            assert layer.token_residual is not None
+            assert layer.channel_residual is not None
+
+            for is_token, residual in (
+                (True, layer.token_residual),
+                (False, layer.channel_residual),
+            ):
+                if sublayer_index % self.cfg.attnres_block_size == 0:
+                    phase_start = sublayer_index
+                    phase_end = min(
+                        phase_start + self.cfg.attnres_block_size,
+                        len(ordered_residuals),
+                    )
+                    phase = prepare_batched_attention_residual(
+                        ordered_residuals[phase_start:phase_end], completed
+                    )
+                assert phase is not None
+                h = residual.merge_phase(
+                    phase, sublayer_index - phase_start, partial
+                )
+
+                if is_token:
+                    delta = run_token(layer_index, layer, h)
+                else:
+                    delta, aux = layer.channel_delta(h, attention_mask)
+                    aux_loss = aux_loss + aux["aux_loss"]
+                    group_sizes.append(aux["group_sizes"])
+
+                partial = delta if partial is None else partial + delta
+                sublayer_index += 1
+                if sublayer_index % self.cfg.attnres_block_size == 0:
+                    completed = completed.append(
+                        partial, eps=self.cfg.rms_eps
+                    )
+                    partial = None
+
+        if partial is not None:
+            completed = completed.append(partial, eps=self.cfg.rms_eps)
+        assert self.final_residual is not None
+        return (
+            self.final_residual(completed),
+            aux_loss,
+            group_sizes,
+            new_caches,
+        )
+
     def __call__(
         self,
         input_ids: jax.Array,
@@ -580,63 +704,12 @@ class KimiLinear(nnx.Module):
                 x, aux = layer(x, attention_mask, segment_ids)
                 aux_loss = aux_loss + aux["aux_loss"]
                 group_sizes.append(aux["group_sizes"])
-        elif self.cfg.attnres_mode == "full":
-            values = [x]
-            for layer in self.layers:
-                assert layer.token_residual is not None
-                assert layer.channel_residual is not None
-
-                h = layer.token_residual(values)
-                values.append(
-                    layer.token_delta(h, attention_mask, segment_ids)
-                )
-
-                h = layer.channel_residual(values)
-                delta, aux = layer.channel_delta(h, attention_mask)
-                values.append(delta)
-
-                aux_loss = aux_loss + aux["aux_loss"]
-                group_sizes.append(aux["group_sizes"])
-
-            assert self.final_residual is not None
-            x = self.final_residual(values)
         else:
-            # Block AttnRes: completed blocks include the token embedding b_0.
-            # Sublayer deltas are summed inside the current block; only completed
-            # block summaries and the evolving partial sum are attended over.
-            completed = [x]
-            partial = None
-            sublayer_idx = 0
-
-            for layer in self.layers:
-                assert layer.token_residual is not None
-                assert layer.channel_residual is not None
-
-                sources = completed if partial is None else [*completed, partial]
-                h = layer.token_residual(sources)
-                delta = layer.token_delta(h, attention_mask, segment_ids)
-                partial = delta if partial is None else partial + delta
-                sublayer_idx += 1
-                if sublayer_idx % self.cfg.attnres_block_size == 0:
-                    completed.append(partial)
-                    partial = None
-
-                sources = completed if partial is None else [*completed, partial]
-                h = layer.channel_residual(sources)
-                delta, aux = layer.channel_delta(h, attention_mask)
-                partial = delta if partial is None else partial + delta
-                sublayer_idx += 1
-                if sublayer_idx % self.cfg.attnres_block_size == 0:
-                    completed.append(partial)
-                    partial = None
-
-                aux_loss = aux_loss + aux["aux_loss"]
-                group_sizes.append(aux["group_sizes"])
-
-            if partial is not None:
-                completed.append(partial)
-            assert self.final_residual is not None
-            x = self.final_residual(completed)
+            x, aux_loss, group_sizes, _ = self._run_attention_residuals(
+                x,
+                attention_mask=attention_mask,
+                segment_ids=segment_ids,
+            )
 
         x = self.norm_f(x)
         # Upcast logits to fp32 for a numerically stable softmax/cross-entropy under
@@ -679,55 +752,10 @@ class KimiLinear(nnx.Module):
             for layer, cache in zip(self.layers, caches):
                 x, new_cache = layer.step(x, cache)
                 new_caches.append(new_cache)
-        elif self.cfg.attnres_mode == "full":
-            values = [x]
-            for layer, cache in zip(self.layers, caches):
-                assert layer.token_residual is not None
-                assert layer.channel_residual is not None
-
-                h = layer.token_residual(values)
-                h, new_cache = layer.stream_token_delta(h, cache)
-                new_caches.append(new_cache)
-                values.append(h)
-
-                h = layer.channel_residual(values)
-                delta, _ = layer.channel_delta(h)
-                values.append(delta)
-
-            assert self.final_residual is not None
-            x = self.final_residual(values)
         else:
-            completed = [x]
-            partial = None
-            sublayer_idx = 0
-
-            for layer, cache in zip(self.layers, caches):
-                assert layer.token_residual is not None
-                assert layer.channel_residual is not None
-
-                sources = completed if partial is None else [*completed, partial]
-                h = layer.token_residual(sources)
-                delta, new_cache = layer.stream_token_delta(h, cache)
-                new_caches.append(new_cache)
-                partial = delta if partial is None else partial + delta
-                sublayer_idx += 1
-                if sublayer_idx % self.cfg.attnres_block_size == 0:
-                    completed.append(partial)
-                    partial = None
-
-                sources = completed if partial is None else [*completed, partial]
-                h = layer.channel_residual(sources)
-                delta, _ = layer.channel_delta(h)
-                partial = delta if partial is None else partial + delta
-                sublayer_idx += 1
-                if sublayer_idx % self.cfg.attnres_block_size == 0:
-                    completed.append(partial)
-                    partial = None
-
-            if partial is not None:
-                completed.append(partial)
-            assert self.final_residual is not None
-            x = self.final_residual(completed)
+            x, _, _, new_caches = self._run_attention_residuals(
+                x, caches=caches
+            )
 
         x = self.norm_f(x)
         return self.lm_head(x).astype(jnp.float32), new_caches

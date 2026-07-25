@@ -7,7 +7,11 @@ import jax.numpy as jnp
 import pytest
 from flax import nnx
 
-from attention_residual import AttentionResidual
+from attention_residual import (
+    AttentionResidual,
+    AttentionResidualState,
+    prepare_batched_attention_residual,
+)
 from kimi_linear_gdn2 import KimiLinear, KimiLinearConfig
 from multi_latent_attention.attention import (
     GatedMultiHeadLatentAttention,
@@ -58,6 +62,102 @@ def test_attnres_zero_query_starts_as_uniform_average():
 
     assert jnp.allclose(weights, jnp.full((3, 1, 2), 1.0 / 3.0))
     assert jnp.allclose(output, 3.0 * jnp.ones((1, 2, 3)))
+
+
+def test_cached_attnres_matches_original_rmsnorm_formulation():
+    residual = AttentionResidual(5, rngs=nnx.Rngs(29))
+    residual.query[...] = jnp.linspace(-0.4, 0.5, 5)
+    residual.key_norm.weight[...] = jnp.linspace(0.7, 1.3, 5)
+    values = [
+        jax.random.normal(jax.random.key(index), (2, 3, 5))
+        for index in range(3)
+    ]
+    partial = jax.random.normal(jax.random.key(30), (2, 3, 5))
+    stacked = jnp.stack((*values, partial), axis=0)
+
+    keys = residual.key_norm(stacked).astype(jnp.float32)
+    logits = jnp.einsum(
+        "d,sbtd->sbt", residual.query[...].astype(jnp.float32), keys
+    )
+    expected_weights = jax.nn.softmax(logits, axis=0)
+    expected = jnp.einsum("sbt,sbtd->btd", expected_weights, stacked)
+
+    state = AttentionResidualState.initialize(values[0], eps=residual.key_norm.eps)
+    for value in values[1:]:
+        state = state.append(value, eps=residual.key_norm.eps)
+    actual, actual_weights = residual(
+        state, partial=partial, return_weights=True
+    )
+
+    assert state.values.shape == state.normalized.shape == (3, 2, 3, 5)
+    assert jnp.allclose(actual_weights, expected_weights, atol=2e-6, rtol=2e-6)
+    assert jnp.allclose(actual, expected, atol=2e-6, rtol=2e-6)
+
+
+def test_two_phase_attnres_matches_independent_softmax_and_gradients():
+    residuals = [
+        AttentionResidual(4, rngs=nnx.Rngs(31 + index))
+        for index in range(3)
+    ]
+    for index, residual in enumerate(residuals, start=1):
+        residual.query[...] = index * jnp.linspace(-0.2, 0.3, 4)
+        residual.key_norm.weight[...] = jnp.linspace(0.8, 1.2, 4)
+
+    completed = [
+        jax.random.normal(jax.random.key(35 + index), (1, 3, 4))
+        for index in range(3)
+    ]
+    partials = [
+        None,
+        jax.random.normal(jax.random.key(38), (1, 3, 4)),
+        jax.random.normal(jax.random.key(39), (1, 3, 4)),
+    ]
+
+    state = AttentionResidualState.initialize(completed[0], eps=1e-5)
+    for value in completed[1:]:
+        state = state.append(value, eps=1e-5)
+    phase = prepare_batched_attention_residual(residuals, state)
+
+    for index, (residual, partial) in enumerate(zip(residuals, partials)):
+        expected_values = completed if partial is None else [*completed, partial]
+        expected = residual(expected_values)
+        actual = residual.merge_phase(phase, index, partial)
+        assert jnp.allclose(actual, expected, atol=2e-6, rtol=2e-6)
+
+    def direct_loss(partial):
+        return jnp.sum(residuals[1]([*completed, partial]) ** 2)
+
+    def phased_loss(partial):
+        current_phase = prepare_batched_attention_residual(residuals, state)
+        return jnp.sum(residuals[1].merge_phase(current_phase, 1, partial) ** 2)
+
+    direct_grad = jax.grad(direct_loss)(partials[1])
+    phased_grad = jax.grad(phased_loss)(partials[1])
+    assert jnp.allclose(phased_grad, direct_grad, atol=3e-5, rtol=3e-5)
+
+    def direct_source_loss(first_source):
+        return jnp.sum(
+            residuals[1]([first_source, *completed[1:], partials[1]]) ** 2
+        )
+
+    def phased_source_loss(first_source):
+        current_state = AttentionResidualState.initialize(
+            first_source, eps=1e-5
+        )
+        for value in completed[1:]:
+            current_state = current_state.append(value, eps=1e-5)
+        current_phase = prepare_batched_attention_residual(
+            residuals, current_state
+        )
+        return jnp.sum(
+            residuals[1].merge_phase(current_phase, 1, partials[1]) ** 2
+        )
+
+    direct_source_grad = jax.grad(direct_source_loss)(completed[0])
+    phased_source_grad = jax.grad(phased_source_loss)(completed[0])
+    assert jnp.allclose(
+        phased_source_grad, direct_source_grad, atol=3e-5, rtol=3e-5
+    )
 
 
 def test_latent_moe_sparse_dispatch_matches_dense_reference():
@@ -287,6 +387,18 @@ def test_generation_validates_token_count_and_cache_capacity():
         model.generate(prompt, -1)
     with pytest.raises(ValueError, match="too small"):
         model.generate(prompt, 3, max_len=3)
+
+
+def test_generation_runs_jitted_two_phase_attnres_decode():
+    model = KimiLinear(tiny_config(), rngs=nnx.Rngs(40))
+    generated = model.generate(
+        jnp.array([[1, 2, 3]], jnp.int32),
+        max_new_tokens=2,
+        max_len=5,
+    )
+
+    assert generated.shape == (1, 2)
+    assert jnp.issubdtype(generated.dtype, jnp.integer)
 
 
 def test_latent_moe_presets_require_integer_compression_ratio():

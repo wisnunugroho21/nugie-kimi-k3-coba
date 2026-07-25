@@ -27,6 +27,22 @@ KimiLinearConfig(
 )
 ```
 
+### Optimized Attention Residuals
+
+AttnRes uses a reusable source cache instead of stacking and RMS-normalizing the
+entire depth history for every destination layer. Block mode also implements the
+paper's exact two-phase schedule:
+
+1. All pseudo-queries in the current block attend to completed block summaries
+   in one batched operation.
+2. Each sublayer merges its evolving intra-block partial through numerically
+   stable online softmax.
+
+The same residual execution engine is shared by training, prefill, and streaming
+decode, preventing their block topology from drifting apart. Full AttnRes also
+uses cached normalized sources, while retaining its original per-sublayer
+semantics.
+
 ### LatentMoE design modes
 
 `moe_n_routed` and `moe_top_k` describe the baseline standard-MoE values `N`
