@@ -83,6 +83,10 @@ class GroupedQueryLatentAttention(nnx.Module):
         self.compute_dtype = compute_dtype
         # GQA constraint: every KV (latent) head must serve a whole number of
         # query heads, so that `repeat` below tiles the latent evenly.
+        if embed_dim < 1 or num_q_heads < 1 or num_kv_heads < 1 or head_dim < 1:
+            raise ValueError(
+                "embed_dim, num_q_heads, num_kv_heads, and head_dim must be positive"
+            )
         if num_q_heads % num_kv_heads != 0:
             raise ValueError(
                 f"num_q_heads ({num_q_heads}) must be divisible by num_kv_heads ({num_kv_heads})."
@@ -233,10 +237,13 @@ class GroupedQueryLatentAttention(nnx.Module):
     #  new positions are written into it.  Use it for prefill (L = prompt length)
     #  and per-token decode (L = 1) alike.
     # ----------------------------------------------------------------------- #
-    def init_cache(self, batch_size: int, max_len: int, dtype=F32) -> MLACache:
+    def init_cache(self, batch_size: int, max_len: int, dtype=None) -> MLACache:
         """Initialize the streaming KV cache for a given batch size and max length.
         The cache is a preallocated buffer of shape [B, max_len, Hkv*Dh] and a position counter.
         The buffer is filled with zeros initially."""
+        if batch_size < 1 or max_len < 1:
+            raise ValueError("batch_size and max_len must be positive")
+        dtype = self.compute_dtype if dtype is None else dtype
         d_kv = self.num_kv_heads * self.head_dim
         return MLACache(
             l_kv=jnp.zeros((batch_size, max_len, d_kv), dtype),
@@ -249,6 +256,25 @@ class GroupedQueryLatentAttention(nnx.Module):
         B, L, _ = x.shape
         max_len = cache.l_kv.shape[1]
         new_pos = cache.pos + L
+        if L < 1:
+            raise ValueError("Streaming MLA requires at least one input token")
+        if L > max_len:
+            raise ValueError(
+                f"Input chunk length {L} exceeds MLA cache capacity {max_len}"
+            )
+        if cache.l_kv.shape[0] != B:
+            raise ValueError(
+                f"Cache batch size {cache.l_kv.shape[0]} does not match input {B}"
+            )
+        # Eager calls receive a concrete scalar and can report overflow cleanly.
+        # Jitted decode is protected by KimiLinear.generate's static capacity check.
+        if not isinstance(cache.pos, jax.core.Tracer):
+            pos = int(cache.pos)
+            if pos + L > max_len:
+                raise ValueError(
+                    f"MLA cache capacity {max_len} exceeded by positions "
+                    f"[{pos}, {pos + L})"
+                )
 
         # Queries for the new positions (already in the compressed K space via W_UK).
         q_heads = (
@@ -268,9 +294,9 @@ class GroupedQueryLatentAttention(nnx.Module):
         l_kv_rep = l_kv_heads.repeat(self.group_size, axis=1)  # (B, Hq, max_len, Dh)
 
         # Scores: the L new queries attend over all max_len cached slots.
-        logits = jnp.einsum("bhqd, bhkd -> bhqk", q_heads, l_kv_rep) / jnp.sqrt(
-            self.head_dim
-        )
+        logits = jnp.einsum("bhqd, bhkd -> bhqk", q_heads, l_kv_rep).astype(
+            F32
+        ) / jnp.sqrt(self.head_dim)
 
         # Causal mask offset by the cache position: query i sits at absolute position
         # pos+i and may attend to slot j iff j <= pos+i.  This also masks the not-yet-
@@ -281,7 +307,7 @@ class GroupedQueryLatentAttention(nnx.Module):
         logits = jnp.where(mask[None, None], logits, -jnp.inf)
 
         # Softmax over the key axis -> per-query attention distribution.
-        a = jax.nn.softmax(logits, axis=-1)
+        a = jax.nn.softmax(logits, axis=-1).astype(l_kv_rep.dtype)
 
         # Weighted sum of value-latents: the same latent serves as both K and V.
         weighted = jnp.einsum("bhqk, bhkd -> bhqd", a, l_kv_rep)  # (B, Hq, L, Dh)

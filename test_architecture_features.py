@@ -102,6 +102,39 @@ def test_gated_mla_full_and_cached_prefill_match():
     assert int(cache.pos) == 5
 
 
+def test_gated_mla_bfloat_cache_uses_compute_dtype_and_stays_equivalent():
+    mla = GatedMultiHeadLatentAttention(
+        embed_dim=12,
+        num_q_heads=3,
+        num_kv_heads=1,
+        head_dim=4,
+        compute_dtype=jnp.bfloat16,
+        rngs=nnx.Rngs(9),
+    )
+    x = jax.random.normal(jax.random.key(10), (1, 5, 12))
+    cache = mla.init_cache(batch_size=1, max_len=7)
+
+    full = mla(x)
+    cached, _ = mla.step(x, cache)
+
+    assert cache.l_kv.dtype == jnp.bfloat16
+    assert jnp.allclose(full, cached, rtol=2e-2, atol=2e-3)
+
+
+def test_gated_mla_rejects_cache_overflow():
+    mla = GatedMultiHeadLatentAttention(
+        embed_dim=8,
+        num_q_heads=2,
+        num_kv_heads=1,
+        head_dim=4,
+        rngs=nnx.Rngs(11),
+    )
+    x = jnp.ones((1, 3, 8))
+
+    with pytest.raises(ValueError, match="exceeds MLA cache capacity"):
+        mla.step(x, mla.init_cache(batch_size=1, max_len=2))
+
+
 def test_gated_mla_gate_is_applied_before_linear_output_projection():
     kwargs = dict(
         embed_dim=12,
@@ -128,21 +161,75 @@ def test_model_full_and_cached_prefill_match(attnres_mode):
         tiny_config(attnres_mode=attnres_mode),
         rngs=nnx.Rngs(5),
     )
-    ids = jnp.array([[1, 2, 3, 4]], jnp.int32)
+    # Length five deliberately leaves a ragged token after two-token GDN chunks.
+    ids = jnp.array([[1, 2, 3, 4, 5]], jnp.int32)
 
     full, aux = model(ids)
     cached, caches = model.step(ids, model.init_cache(batch_size=1, max_len=8))
 
-    assert full.shape == (1, 4, 32)
+    assert full.shape == (1, 5, 32)
     assert aux["group_sizes"].shape == (2, 4)
     assert len(caches) == 2
     assert jnp.all(jnp.isfinite(full))
     assert jnp.allclose(full, cached, rtol=2e-5, atol=2e-5)
 
 
+def test_nonzero_block_attnres_matches_token_by_token_streaming():
+    model = KimiLinear(
+        tiny_config(attnres_mode="block", attnres_block_size=3),
+        rngs=nnx.Rngs(12),
+    )
+    residuals = []
+    for layer in model.layers:
+        assert layer.token_residual is not None
+        assert layer.channel_residual is not None
+        residuals.extend((layer.token_residual, layer.channel_residual))
+    assert model.final_residual is not None
+    residuals.append(model.final_residual)
+    for index, residual in enumerate(residuals, start=1):
+        residual.query[...] = index * jnp.linspace(-0.1, 0.1, 16)
+
+    ids = jnp.array([[1, 2, 3, 4, 5]], jnp.int32)
+    full, _ = model(ids)
+    caches = model.init_cache(batch_size=1, max_len=8)
+    outputs = []
+    for position in range(ids.shape[1]):
+        output, caches = model.step(ids[:, position : position + 1], caches)
+        outputs.append(output)
+    streamed = jnp.concatenate(outputs, axis=1)
+
+    assert jnp.allclose(full, streamed, rtol=2e-5, atol=2e-5)
+
+
+@pytest.mark.parametrize(
+    "override, message",
+    [
+        ({"n_layers": 0}, "n_layers must be positive"),
+        ({"gdn_chunk_size": 0}, "gdn_chunk_size must be positive"),
+        ({"mla_num_kv_heads": 0}, "mla_num_kv_heads must be positive"),
+        ({"moe_top_k": 0}, "moe_top_k must be positive"),
+        ({"compute_dtype": "float16"}, "compute_dtype"),
+    ],
+)
+def test_invalid_configurations_fail_early(override, message):
+    with pytest.raises(ValueError, match=message):
+        tiny_config(**override)
+
+
+def test_generation_validates_token_count_and_cache_capacity():
+    model = KimiLinear(tiny_config(), rngs=nnx.Rngs(13))
+    prompt = jnp.array([[1, 2]], jnp.int32)
+
+    assert model.generate(prompt, 0).shape == (1, 0)
+    with pytest.raises(ValueError, match="cannot be negative"):
+        model.generate(prompt, -1)
+    with pytest.raises(ValueError, match="too small"):
+        model.generate(prompt, 3, max_len=3)
+
+
 def test_all_new_parameters_receive_finite_gradients():
     model = KimiLinear(tiny_config(), rngs=nnx.Rngs(6))
-    ids = jnp.array([[1, 2]], jnp.int32)
+    ids = jnp.array([[1, 2, 3]], jnp.int32)
 
     def loss_fn(m):
         logits, aux = m(ids)

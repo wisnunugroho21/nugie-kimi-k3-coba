@@ -99,8 +99,7 @@ class KimiLinearConfig:
     gdn_head_v_dim: int = 64  # d_v                 (paper: 128)
     gdn_num_v_heads: int | None = None  # H_v for GQA value heads; None -> = num_heads
     gdn_chunk_size: int = 64  # chunkwise block size C (paper App.: 64).
-    #   NOTE: the GDN-2 chunkwise core requires every fed sequence length to be a
-    #   multiple of this C (it reshapes L into L/C chunks). Keep seq_len % C == 0.
+    # Non-aligned training lengths use the recurrent core for their ragged tail.
     gdn_conv_size: int = 4  # short-conv kernel width
     gdn_expanded_erase: bool = False  # erase gate in [0,2] (neg-eigenvalue variant)
 
@@ -149,6 +148,30 @@ class KimiLinearConfig:
     compute_dtype: str = "float32"
 
     def __post_init__(self):
+        positive = {
+            "vocab_size": self.vocab_size,
+            "d_model": self.d_model,
+            "n_layers": self.n_layers,
+            "full_attn_period": self.full_attn_period,
+            "gdn_num_heads": self.gdn_num_heads,
+            "gdn_head_k_dim": self.gdn_head_k_dim,
+            "gdn_head_v_dim": self.gdn_head_v_dim,
+            "gdn_chunk_size": self.gdn_chunk_size,
+            "gdn_conv_size": self.gdn_conv_size,
+            "mla_num_q_heads": self.mla_num_q_heads,
+            "mla_num_kv_heads": self.mla_num_kv_heads,
+            "mla_head_dim": self.mla_head_dim,
+            "max_seq_len": self.max_seq_len,
+            "moe_d_ff": self.moe_d_ff,
+            "moe_n_routed": self.moe_n_routed,
+            "moe_n_shared": self.moe_n_shared,
+            "moe_top_k": self.moe_top_k,
+            "moe_n_groups": self.moe_n_groups,
+            "moe_topk_groups": self.moe_topk_groups,
+        }
+        for name, value in positive.items():
+            if value < 1:
+                raise ValueError(f"{name} must be positive, got {value}")
         if self.attnres_mode not in {"none", "full", "block"}:
             raise ValueError("attnres_mode must be 'none', 'full', or 'block'")
         if self.attnres_block_size < 1:
@@ -157,10 +180,32 @@ class KimiLinearConfig:
             1 <= self.moe_latent_dim <= self.d_model
         ):
             raise ValueError("moe_latent_dim must be in [1, d_model] or None")
-        if self.full_attn_period < 1:
-            raise ValueError("full_attn_period must be positive")
-        if self.max_seq_len < 1:
-            raise ValueError("max_seq_len must be positive")
+        if self.gdn_num_v_heads is not None and self.gdn_num_v_heads < 1:
+            raise ValueError("gdn_num_v_heads must be positive or None")
+        gdn_v_heads = (
+            self.gdn_num_heads
+            if self.gdn_num_v_heads is None
+            else self.gdn_num_v_heads
+        )
+        if gdn_v_heads < 1 or gdn_v_heads % self.gdn_num_heads != 0:
+            raise ValueError(
+                "gdn_num_v_heads must be positive and a multiple of gdn_num_heads"
+            )
+        if self.mla_num_q_heads % self.mla_num_kv_heads != 0:
+            raise ValueError("mla_num_q_heads must be divisible by mla_num_kv_heads")
+        if self.moe_n_routed % self.moe_n_groups != 0:
+            raise ValueError("moe_n_routed must be divisible by moe_n_groups")
+        if self.moe_topk_groups > self.moe_n_groups:
+            raise ValueError("moe_topk_groups cannot exceed moe_n_groups")
+        group_size = self.moe_n_routed // self.moe_n_groups
+        if self.moe_top_k > self.moe_topk_groups * group_size:
+            raise ValueError(
+                "moe_top_k exceeds the experts available in selected groups"
+            )
+        if self.rms_eps <= 0:
+            raise ValueError("rms_eps must be positive")
+        if self.compute_dtype not in {"float32", "bfloat16"}:
+            raise ValueError("compute_dtype must be 'float32' or 'bfloat16'")
 
     @property
     def cdtype(self) -> jnp.dtype:
@@ -269,7 +314,7 @@ class DecoderLayer(nnx.Module):
         x = x + m
         return x, aux
 
-    def init_cache(self, batch_size: int, max_len: int, dtype=jnp.float32):
+    def init_cache(self, batch_size: int, max_len: int, dtype=None):
         """Per-layer streaming cache: a GDN2Cache (linear layer) or MLACache (MLA)."""
         return self.token_mixer.init_cache(batch_size, max_len, dtype)
 
@@ -343,6 +388,21 @@ class KimiLinear(nnx.Module):
             rngs=rngs,
         )
 
+    @staticmethod
+    def _validate_input_ids(input_ids: jax.Array, *, max_len: int | None = None):
+        if input_ids.ndim != 2:
+            raise ValueError(
+                f"input_ids must have shape [batch, length], got {input_ids.shape}"
+            )
+        if input_ids.shape[0] < 1 or input_ids.shape[1] < 1:
+            raise ValueError("input_ids batch and sequence dimensions must be non-zero")
+        if not jnp.issubdtype(input_ids.dtype, jnp.integer):
+            raise TypeError(f"input_ids must use an integer dtype, got {input_ids.dtype}")
+        if max_len is not None and input_ids.shape[1] > max_len:
+            raise ValueError(
+                f"Sequence length {input_ids.shape[1]} exceeds max_seq_len {max_len}"
+            )
+
     def __call__(self, input_ids: jax.Array) -> tuple[jax.Array, dict[str, ArrayLike]]:
         """input_ids: int[B, L] -> (logits[B, L, vocab], aux).
 
@@ -352,6 +412,7 @@ class KimiLinear(nnx.Module):
         The training loop uses aux_loss (added to the CE loss) and group_sizes (to nudge
         each MoE layer's router bias); eval/inference paths simply ignore it.
         """
+        self._validate_input_ids(input_ids, max_len=self.cfg.max_seq_len)
         aux_loss: ArrayLike = 0.0
         group_sizes: list[
             ArrayLike
@@ -432,16 +493,22 @@ class KimiLinear(nnx.Module):
     #  generation O(1) per token for the linear layers instead of re-reading history.
     # ----------------------------------------------------------------------- #
     def init_cache(
-        self, batch_size: int, max_len: int | None = None, dtype=jnp.float32
+        self, batch_size: int, max_len: int | None = None, dtype=None
     ) -> list:
         """Streaming caches for every layer. `max_len` (default cfg.max_seq_len) sizes
         the MLA latent buffers; GDN-2 layers ignore it (their state is fixed-size)."""
-        max_len = max_len or self.cfg.max_seq_len
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        max_len = self.cfg.max_seq_len if max_len is None else max_len
+        if max_len < 1:
+            raise ValueError("max_len must be positive")
+        dtype = self.cfg.cdtype if dtype is None else dtype
         return [layer.init_cache(batch_size, max_len, dtype) for layer in self.layers]
 
     def step(self, input_ids: jax.Array, caches: list) -> tuple[jax.Array, list]:
         """One streaming step. input_ids: int[B, L] (L = prompt length on prefill, or
         1 per decoded token). Returns (logits[B, L, vocab], new_caches)."""
+        self._validate_input_ids(input_ids)
         new_caches = []
 
         if len(caches) != len(self.layers):
@@ -522,12 +589,26 @@ class KimiLinear(nnx.Module):
         cache. The decode loop runs through `_decode_step`, a module-level nnx.jit
         function: it compiles once per (batch size, cache length) and every further
         token — across generate() calls too — reuses the trace."""
+        self._validate_input_ids(prompt_ids)
+        if max_new_tokens < 0:
+            raise ValueError("max_new_tokens cannot be negative")
+
         B, P = prompt_ids.shape
+        if max_new_tokens == 0:
+            return jnp.empty((B, 0), dtype=prompt_ids.dtype)
+
         # Default the cache length to the config's declared context cap when the
         # request fits inside it: a FIXED cache shape lets _decode_step reuse its
         # compiled trace across generate() calls with different prompt lengths
         # (e.g. a chat loop) instead of recompiling for every P + max_new_tokens.
-        max_len = max_len or max(self.cfg.max_seq_len, P + max_new_tokens)
+        required_cache_len = P + max_new_tokens - 1
+        if max_len is None:
+            max_len = max(self.cfg.max_seq_len, required_cache_len)
+        elif max_len < required_cache_len:
+            raise ValueError(
+                f"max_len={max_len} is too small; generation requires at least "
+                f"{required_cache_len} cache positions"
+            )
 
         caches = self.init_cache(B, max_len)
         logits, caches = self.step(prompt_ids, caches)  # prefill the prompt

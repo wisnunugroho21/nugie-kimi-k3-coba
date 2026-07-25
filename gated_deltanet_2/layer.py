@@ -169,6 +169,8 @@ class ShortConv(nnx.Module):
     """
 
     def __init__(self, channels: int, kernel_size: int = 4, *, rngs: nnx.Rngs):
+        if channels < 1 or kernel_size < 1:
+            raise ValueError("ShortConv channels and kernel_size must be positive")
         self.channels = channels
         self.kernel_size = kernel_size
         self.conv = nnx.Conv(
@@ -229,12 +231,25 @@ class GatedDeltaNet2(nnx.Module):
         # Matmul dtype for the q/k/v/b/w/o projection Linears (bf16 on H200). The
         # chunkwise/recurrent core (core.py) upcasts to fp32 regardless, and the
         # log-decay branch (f_proj) is kept fp32 below — both for numerical safety.
+        if (
+            d_model < 1
+            or num_heads < 1
+            or head_k_dim < 1
+            or head_v_dim < 1
+            or chunk_size < 1
+            or conv_size < 1
+        ):
+            raise ValueError("GDN-2 dimensions, chunk_size, and conv_size must be positive")
+        if num_v_heads is not None and num_v_heads < 1:
+            raise ValueError("num_v_heads must be positive or None")
+
         self.compute_dtype = compute_dtype
         self.d_model = d_model
         self.H = num_heads
-        self.Hv = num_v_heads or num_heads
+        self.Hv = num_heads if num_v_heads is None else num_v_heads
 
-        assert self.Hv % self.H == 0, "num_v_heads must be a multiple of num_heads"
+        if self.Hv % self.H != 0:
+            raise ValueError("num_v_heads must be a multiple of num_heads")
 
         self.group = self.Hv // self.H  # G, value-head group size (App. C.1)
         self.dk = head_k_dim
@@ -433,24 +448,51 @@ class GatedDeltaNet2(nnx.Module):
     def __call__(
         self, x: jax.Array, initial_state: jax.Array | None = None
     ) -> jax.Array:
-        """Full-sequence (training) forward via the CHUNKWISE parallel core.
+        """Full-sequence training forward with a chunkwise prefix and ragged tail.
         x: [B, L, d_model] -> out: [B, L, d_model].
 
-        The core also produces the end-of-sequence recurrent state, but training only
-        needs the outputs, so it is discarded here (the streaming `step` below is what
-        threads the state across calls). `initial_state` lets a caller warm-start from a
-        prior state; it defaults to zeros."""
-        B, _, _ = x.shape
+        A chunk-aligned prefix uses the parallel core and any remaining tokens use
+        the exact recurrent rule. Training therefore supports arbitrary non-empty
+        sequence lengths while retaining the fast chunkwise path. The final state is
+        discarded; `initial_state` can optionally warm-start the recurrence."""
+        B, L, _ = x.shape
+        if L < 1:
+            raise ValueError("GatedDeltaNet2 requires at least one input token")
         q, k, v, g, b, w, _ = self._project(x, conv_states=None)
 
         if initial_state is None:
             initial_state = jnp.zeros((B, self.Hv, self.dk, self.dv), jnp.float32)
 
-        # Gated Delta Rule-2 chunkwise core (Eq. 10); forms cumsum γ internally (Eq. 30).
-        o, _ = chunkwise_gated_delta_rule_2(
-            q, k, v, g, b, w, initial_state, chunk_size=self.chunk_size
-        )
+        n_full = (L // self.chunk_size) * self.chunk_size
+        state = initial_state
+        outputs = []
 
+        if n_full > 0:
+            o_full, state = chunkwise_gated_delta_rule_2(
+                q[:, :, :n_full],
+                k[:, :, :n_full],
+                v[:, :, :n_full],
+                g[:, :, :n_full],
+                b[:, :, :n_full],
+                w[:, :, :n_full],
+                state,
+                chunk_size=self.chunk_size,
+            )
+            outputs.append(o_full)
+
+        if n_full < L:
+            o_tail, _ = recurrent_gated_delta_rule_2(
+                q[:, :, n_full:],
+                k[:, :, n_full:],
+                v[:, :, n_full:],
+                g[:, :, n_full:],
+                b[:, :, n_full:],
+                w[:, :, n_full:],
+                state,
+            )
+            outputs.append(o_tail)
+
+        o = outputs[0] if len(outputs) == 1 else jnp.concatenate(outputs, axis=2)
         return self._output(o, x)
 
     # ----------------------------------------------------------------------- #
@@ -464,11 +506,14 @@ class GatedDeltaNet2(nnx.Module):
     #     decode : out, cache = layer.step(one_token, cache)   # repeat
     # ----------------------------------------------------------------------- #
     def init_cache(
-        self, batch_size: int, max_len: int | None = None, dtype=jnp.float32
+        self, batch_size: int, max_len: int | None = None, dtype=None
     ) -> GDN2Cache:
         """Empty streaming cache. `max_len` is accepted for a uniform interface with
         the MLA cache but UNUSED here — the GDN-2 state is fixed-size, independent of
         sequence length (the point of linear attention)."""
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        dtype = self.compute_dtype if dtype is None else dtype
         kc = self.conv_size - 1
         return GDN2Cache(
             recurrent_state=jnp.zeros(
@@ -493,6 +538,10 @@ class GatedDeltaNet2(nnx.Module):
         which is what dominates on accelerators. On CPU the recurrent scan is
         already compute-bound and the chunkwise core's pairwise-ratio tensor
         costs O(L·C·dk), so there the chunkwise path only wins for small C."""
+        if x.ndim != 3 or x.shape[1] < 1:
+            raise ValueError("GDN-2 streaming input must have shape [B, L, D], L >= 1")
+        if x.shape[0] != cache.recurrent_state.shape[0]:
+            raise ValueError("GDN-2 cache batch size does not match the input")
         q, k, v, g, b, w, new_conv = self._project(
             x, conv_states=(cache.q_conv, cache.k_conv, cache.v_conv)
         )

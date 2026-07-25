@@ -75,11 +75,16 @@ class GroupedGemmMoE(nnx.Module):
         compute_dtype: jnp.dtype = jnp.float32,
         rngs: nnx.Rngs,
     ):
-        assert n_routed % n_groups == 0, "n_routed must be divisible by n_groups"
-        assert 1 <= topk_groups <= n_groups, "need 1 <= topk_groups <= n_groups"
-        assert top_k <= topk_groups * (n_routed // n_groups), (
-            "top_k experts must fit inside the topk_groups selected groups"
-        )
+        if min(d_model, d_ff, n_routed, n_shared, top_k, n_groups, topk_groups) < 1:
+            raise ValueError("MoE dimensions, expert counts, and routing counts must be positive")
+        if n_routed % n_groups != 0:
+            raise ValueError("n_routed must be divisible by n_groups")
+        if topk_groups > n_groups:
+            raise ValueError("topk_groups cannot exceed n_groups")
+        if top_k > topk_groups * (n_routed // n_groups):
+            raise ValueError(
+                "top_k experts must fit inside the topk_groups selected groups"
+            )
         if latent_dim is not None and not 1 <= latent_dim <= d_model:
             raise ValueError(
                 f"latent_dim must be in [1, d_model={d_model}], got {latent_dim}"
