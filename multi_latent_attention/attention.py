@@ -159,9 +159,28 @@ class GroupedQueryLatentAttention(nnx.Module):
             weighted_latents = weighted_latents.astype(F32) * gate
         return self.w_uv_o(weighted_latents.astype(self.compute_dtype))
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self, x: jax.Array, attention_mask: jax.Array | None = None
+    ) -> jax.Array:
+        """Full-sequence causal attention.
+
+        ``attention_mask`` is a boolean/numeric ``[B, T]`` mask. Masked positions
+        are excluded as keys and produce an all-zero mixer delta as queries. The
+        diagonal fallback for masked queries keeps softmax rows finite while the
+        final output mask guarantees those rows cannot enter the residual stream.
+        """
         # x: (B, T, embed_dim)
         batch_size, seq_length, _ = x.shape
+        if attention_mask is None:
+            valid = jnp.ones((batch_size, seq_length), dtype=bool)
+        else:
+            if attention_mask.shape != (batch_size, seq_length):
+                raise ValueError(
+                    "attention_mask must have shape "
+                    f"{(batch_size, seq_length)}, got {attention_mask.shape}"
+                )
+            valid = attention_mask.astype(bool)
+        x = jnp.where(valid[..., None], x, 0)
 
         # --- Queries (already in the compressed K space via the absorbed W_UK) ---
         q_latent = self.w_q_uk(x)  # (B, T, num_q_heads * head_dim)
@@ -204,7 +223,12 @@ class GroupedQueryLatentAttention(nnx.Module):
         # the module state or in checkpoints. Safe to use -inf because the diagonal
         # is always kept (no fully-masked rows -> the softmax cannot NaN).
         causal_mask = jnp.tril(jnp.ones((seq_length, seq_length), dtype=bool))
-        scaled_logits = jnp.where(causal_mask[None, None], scaled_logits, -jnp.inf)
+        mask = causal_mask[None, :, :] & valid[:, None, :]
+        # A masked query may otherwise have no valid keys (for example left
+        # padding). Retaining its diagonal yields a finite, disposable softmax row.
+        diagonal = jnp.eye(seq_length, dtype=bool)[None, :, :]
+        mask = mask | ((~valid)[:, :, None] & diagonal)
+        scaled_logits = jnp.where(mask[:, None], scaled_logits, -jnp.inf)
 
         # Softmax over the key axis -> per-query attention distribution (fp32), then
         # back to the compute dtype for the (bf16) weighted-sum matmul below.
@@ -229,7 +253,7 @@ class GroupedQueryLatentAttention(nnx.Module):
         # Absorbed W_UV . W_O: up-project the value latent and output-project.
         output = self._output(weighted_latents, x)  # (B, T, embed_dim)
 
-        return output
+        return jnp.where(valid[..., None], output, 0)
 
     # ----------------------------------------------------------------------- #
     #  Streaming / inference.  Same softmax attention, but the KV latents of past

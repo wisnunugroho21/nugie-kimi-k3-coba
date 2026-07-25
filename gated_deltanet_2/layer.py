@@ -399,8 +399,10 @@ class GatedDeltaNet2(nnx.Module):
         v = self._split_v(v, B, L)
 
         # L2-normalize q, k per head (Sec. 3.5 "L2 normalization applied to q_t and k_t"; App. D.2).
-        q = q / (jnp.linalg.norm(q, axis=-1, keepdims=True) + 1e-6)
-        k = k / (jnp.linalg.norm(k, axis=-1, keepdims=True) + 1e-6)
+        # Put epsilon inside sqrt. ``linalg.norm(x) + eps`` has an undefined
+        # derivative at x=0, which is routinely reached by masked padding.
+        q = q * jax.lax.rsqrt(jnp.sum(q * q, axis=-1, keepdims=True) + 1e-6)
+        k = k * jax.lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + 1e-6)
 
         # Log-decay branch, computed in fp32 outside the kernel (Eq. 12 / 86; App. C.1 / D.1).
         #   g_t = -exp(a) ⊙ softplus(Proj_f(x_t) + δ),  then α_t = exp(g_t) inside the core.
@@ -446,7 +448,10 @@ class GatedDeltaNet2(nnx.Module):
         return self.o_proj(o)  # project back to d_model
 
     def __call__(
-        self, x: jax.Array, initial_state: jax.Array | None = None
+        self,
+        x: jax.Array,
+        initial_state: jax.Array | None = None,
+        attention_mask: jax.Array | None = None,
     ) -> jax.Array:
         """Full-sequence training forward with a chunkwise prefix and ragged tail.
         x: [B, L, d_model] -> out: [B, L, d_model].
@@ -458,7 +463,29 @@ class GatedDeltaNet2(nnx.Module):
         B, L, _ = x.shape
         if L < 1:
             raise ValueError("GatedDeltaNet2 requires at least one input token")
-        q, k, v, g, b, w, _ = self._project(x, conv_states=None)
+        if attention_mask is None:
+            valid = jnp.ones((B, L), dtype=bool)
+        else:
+            if attention_mask.shape != (B, L):
+                raise ValueError(
+                    f"attention_mask must have shape {(B, L)}, "
+                    f"got {attention_mask.shape}"
+                )
+            valid = attention_mask.astype(bool)
+
+        # Zeroing the projection input gives left padding the same short-conv
+        # history as the causal zero padding at the beginning of a sequence.
+        x_masked = jnp.where(valid[..., None], x, 0)
+        q, k, v, g, b, w, _ = self._project(x_masked, conv_states=None)
+        step_valid = valid[:, None, :, None]
+        # A padded recurrent step must be the identity: alpha=1 (g=0), no erase,
+        # no write, and no read. This is stronger than merely masking the loss.
+        q = jnp.where(step_valid, q, 0)
+        k = jnp.where(step_valid, k, 0)
+        v = jnp.where(step_valid, v, 0)
+        g = jnp.where(step_valid, g, 0)
+        b = jnp.where(step_valid, b, 0)
+        w = jnp.where(step_valid, w, 0)
 
         if initial_state is None:
             initial_state = jnp.zeros((B, self.Hv, self.dk, self.dv), jnp.float32)
@@ -493,7 +520,8 @@ class GatedDeltaNet2(nnx.Module):
             outputs.append(o_tail)
 
         o = outputs[0] if len(outputs) == 1 else jnp.concatenate(outputs, axis=2)
-        return self._output(o, x)
+        output = self._output(o, x_masked)
+        return jnp.where(valid[..., None], output, 0)
 
     # ----------------------------------------------------------------------- #
     #  Streaming / inference.  Same math, threading the fixed-size state in -> out.

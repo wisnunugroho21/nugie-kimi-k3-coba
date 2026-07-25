@@ -26,6 +26,58 @@ KimiLinearConfig(
 )
 ```
 
+## Padding-aware training
+
+`training.py` provides right-padding collation, masked next-token loss, AdamW
+with gradient clipping, MoE router-bias updates, evaluation, and versioned
+model/optimizer checkpoints. Padding is masked inside the architecture: MLA
+cannot attend to padded keys, GDN-2 treats padded recurrence steps as identity
+transitions, and MoE load statistics count only real tokens.
+
+```python
+from flax import nnx
+
+from kimi_linear_gdn2 import KimiLinear, KimiLinearConfig
+from training import (
+    TrainingConfig,
+    create_optimizer,
+    make_lm_batch,
+    save_checkpoint,
+    train_step,
+)
+
+model_config = KimiLinearConfig()
+training_config = TrainingConfig()
+model = KimiLinear(model_config, rngs=nnx.Rngs(0))
+optimizer = create_optimizer(model, training_config)
+
+# Raw token sequences include both the first input and final prediction target.
+batch = make_lm_batch(
+    [[1, 2, 3, 4], [5, 6]],
+    pad_token_id=0,
+    max_seq_len=model_config.max_seq_len,
+)
+metrics = train_step(
+    model,
+    optimizer,
+    batch,
+    aux_loss_weight=training_config.aux_loss_weight,
+    router_bias_lr=training_config.router_bias_lr,
+)
+
+save_checkpoint(
+    "checkpoints/step_1",
+    model,
+    optimizer,
+    model_config=model_config,
+    training_config=training_config,
+)
+```
+
+Use `train_epoch(...)` and `evaluate(...)` for iterables of pre-collated batches.
+The model accepts integer or boolean `attention_mask` arrays with the same
+`[batch, length]` shape as `input_ids`.
+
 ## Quick check
 
 ```bash

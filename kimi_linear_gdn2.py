@@ -292,25 +292,31 @@ class DecoderLayer(nnx.Module):
             **moe_kwargs,
         )
 
-    def token_delta(self, h: jax.Array) -> jax.Array:
+    def token_delta(
+        self, h: jax.Array, attention_mask: jax.Array | None = None
+    ) -> jax.Array:
         """Token-mixer sublayer output without applying a residual merge."""
-        return self.token_mixer(self.norm1(h))
+        return self.token_mixer(self.norm1(h), attention_mask=attention_mask)
 
-    def channel_delta(self, h: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
+    def channel_delta(
+        self, h: jax.Array, attention_mask: jax.Array | None = None
+    ) -> tuple[jax.Array, dict[str, jax.Array]]:
         """LatentMoE sublayer output without applying a residual merge."""
-        return self.channel_mixer(self.norm2(h))
+        return self.channel_mixer(self.norm2(h), token_mask=attention_mask)
 
-    def __call__(self, x: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
+    def __call__(
+        self, x: jax.Array, attention_mask: jax.Array | None = None
+    ) -> tuple[jax.Array, dict[str, jax.Array]]:
         """x: [B, L, d_model] -> (x, aux_or_None).
 
         `aux` carries the MoE load-balancing diagnostics the training loop
         needs (aux loss + per-expert token counts for the router-bias update).
         """
         # --- token mixing (residual, pre-norm) ---
-        x = x + self.token_delta(x)
+        x = x + self.token_delta(x, attention_mask)
 
         # --- channel mixing (residual, pre-norm) ---
-        m, aux = self.channel_delta(x)
+        m, aux = self.channel_delta(x, attention_mask)
         x = x + m
         return x, aux
 
@@ -403,25 +409,41 @@ class KimiLinear(nnx.Module):
                 f"Sequence length {input_ids.shape[1]} exceeds max_seq_len {max_len}"
             )
 
-    def __call__(self, input_ids: jax.Array) -> tuple[jax.Array, dict[str, ArrayLike]]:
+    def __call__(
+        self, input_ids: jax.Array, attention_mask: jax.Array | None = None
+    ) -> tuple[jax.Array, dict[str, ArrayLike]]:
         """input_ids: int[B, L] -> (logits[B, L, vocab], aux).
+
+        ``attention_mask`` is an optional boolean/numeric ``[B, L]`` array where
+        true/one marks real tokens. Padding is excluded from MLA keys, GDN-2 state
+        transitions, sublayer outputs, and MoE load-balancing diagnostics.
 
         aux is ALWAYS returned (callers that don't need it just unpack `logits, _ =`):
             aux = {"aux_loss":   scalar, the MoE load-balancing loss summed over layers,
-                   "group_sizes": int[n_layers, E], per-expert token counts per layer}.
+                   "group_sizes": float[n_layers, E], valid-token expert assignments}.
         The training loop uses aux_loss (added to the CE loss) and group_sizes (to nudge
         each MoE layer's router bias); eval/inference paths simply ignore it.
         """
         self._validate_input_ids(input_ids, max_len=self.cfg.max_seq_len)
+        if attention_mask is None:
+            attention_mask = jnp.ones_like(input_ids, dtype=bool)
+        elif attention_mask.shape != input_ids.shape:
+            raise ValueError(
+                "attention_mask must have the same shape as input_ids, got "
+                f"{attention_mask.shape} and {input_ids.shape}"
+            )
+        else:
+            attention_mask = attention_mask.astype(bool)
         aux_loss: ArrayLike = 0.0
         group_sizes: list[
             ArrayLike
         ] = []  # one [E] vector per MoE layer, in layer order
 
         x = self.embed(input_ids)  # [B, L, d_model]
+        x = jnp.where(attention_mask[..., None], x, 0)
         if self.cfg.attnres_mode == "none":
             for layer in self.layers:
-                x, aux = layer(x)
+                x, aux = layer(x, attention_mask)
                 aux_loss = aux_loss + aux["aux_loss"]
                 group_sizes.append(aux["group_sizes"])
         elif self.cfg.attnres_mode == "full":
@@ -431,10 +453,10 @@ class KimiLinear(nnx.Module):
                 assert layer.channel_residual is not None
 
                 h = layer.token_residual(values)
-                values.append(layer.token_delta(h))
+                values.append(layer.token_delta(h, attention_mask))
 
                 h = layer.channel_residual(values)
-                delta, aux = layer.channel_delta(h)
+                delta, aux = layer.channel_delta(h, attention_mask)
                 values.append(delta)
 
                 aux_loss = aux_loss + aux["aux_loss"]
@@ -456,7 +478,7 @@ class KimiLinear(nnx.Module):
 
                 sources = completed if partial is None else [*completed, partial]
                 h = layer.token_residual(sources)
-                delta = layer.token_delta(h)
+                delta = layer.token_delta(h, attention_mask)
                 partial = delta if partial is None else partial + delta
                 sublayer_idx += 1
                 if sublayer_idx % self.cfg.attnres_block_size == 0:
@@ -465,7 +487,7 @@ class KimiLinear(nnx.Module):
 
                 sources = completed if partial is None else [*completed, partial]
                 h = layer.channel_residual(sources)
-                delta, aux = layer.channel_delta(h)
+                delta, aux = layer.channel_delta(h, attention_mask)
                 partial = delta if partial is None else partial + delta
                 sublayer_idx += 1
                 if sublayer_idx % self.cfg.attnres_block_size == 0:

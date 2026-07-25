@@ -224,11 +224,22 @@ class GroupedGemmMoE(nnx.Module):
         return a @ self.ws_down.astype(cd)
 
     # ----------------------------------------------------------------------- #
-    def __call__(self, x: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
+    def __call__(
+        self, x: jax.Array, token_mask: jax.Array | None = None
+    ) -> tuple[jax.Array, dict[str, jax.Array]]:
         B, L, d = x.shape
         T = B * L
         k = self.top_k
-        xf = x.reshape(T, d)
+        if token_mask is None:
+            valid = jnp.ones((B, L), dtype=bool)
+        else:
+            if token_mask.shape != (B, L):
+                raise ValueError(
+                    f"token_mask must have shape {(B, L)}, got {token_mask.shape}"
+                )
+            valid = token_mask.astype(bool)
+        valid_flat = valid.reshape(T)
+        xf = jnp.where(valid_flat[:, None], x.reshape(T, d), 0)
         cdtype = self.compute_dtype  # force bf16 GEMMs even though the residual is fp32
 
         top_idx, gate, router_logits = self._route(xf)
@@ -246,16 +257,20 @@ class GroupedGemmMoE(nnx.Module):
         order = jnp.argsort(flat_e)  # group same-expert rows
         sort_tok = flat_tok[order]
         sort_w = flat_w[order]
-        group_sizes = jnp.bincount(flat_e, length=self.E)  # [E], sums to T*k
+        dispatch_group_sizes = jnp.bincount(
+            flat_e, length=self.E
+        )  # [E], sums to T*k
 
         x_sorted = zf[sort_tok]  # [M, latent_dim], M = T*k
 
         # ---- grouped GEMM: one matmul per expert over its contiguous rows ----
-        h = jax.lax.ragged_dot(x_sorted, self.w_in.astype(cdtype), group_sizes)
+        h = jax.lax.ragged_dot(
+            x_sorted, self.w_in.astype(cdtype), dispatch_group_sizes
+        )
         g_, u_ = jnp.split(h, 2, axis=-1)  # [M, d_ff] each
         a = jax.nn.silu(g_) * u_
         y_sorted = jax.lax.ragged_dot(
-            a, self.w_out.astype(cdtype), group_sizes
+            a, self.w_out.astype(cdtype), dispatch_group_sizes
         )  # [M,d]
 
         # ---- combine: weight, un-permute, sum top-k per token ----
@@ -270,17 +285,27 @@ class GroupedGemmMoE(nnx.Module):
         )
 
         out = routed + self._shared(xf).astype(F32)
+        out = jnp.where(valid_flat[:, None], out, 0)
         out = out.reshape(B, L, d).astype(cdtype)
 
         # ---- diagnostics for the training loop ----
-        load = group_sizes.astype(F32) / (T * k)  # fraction per expert
+        assignment_valid = jnp.repeat(valid_flat.astype(F32), k)
+        group_sizes = jnp.bincount(
+            flat_e, weights=assignment_valid, length=self.E
+        )
+        valid_tokens = valid_flat.astype(F32).sum()
+        assignment_count = jnp.maximum(valid_tokens * k, 1.0)
+        load = group_sizes.astype(F32) / assignment_count
 
         # ---- aux loss ----
         # Switch/DeepSeek-style aux loss: E * <f_e, P_e>, where f_e is the realized
         # per-expert load fraction (non-differentiable; acts as a constant) and P_e
         # the mean softmax routing probability (this is where the gradient flows).
         # Reuses the logits already computed by _route (no second router matmul).
-        probs = jax.nn.softmax(router_logits, axis=-1).mean(0)  # [E]
+        token_probs = jax.nn.softmax(router_logits, axis=-1)
+        probs = (
+            token_probs * valid_flat.astype(F32)[:, None]
+        ).sum(0) / jnp.maximum(valid_tokens, 1.0)
         aux_loss = self.aux_alpha * self.E * jnp.sum(load * probs)
         aux = {"load": load, "aux_loss": aux_loss, "group_sizes": group_sizes}
         return out, aux
@@ -332,9 +357,11 @@ def update_router_bias(
     Nudges the selection bias up for under-loaded experts and down for over-loaded
     ones by a fixed step, driving per-expert load toward uniform without an aux loss.
     """
-    load = group_sizes.astype(F32) / jnp.sum(group_sizes).astype(F32)
+    total = jnp.sum(group_sizes).astype(F32)
+    load = group_sizes.astype(F32) / jnp.maximum(total, 1.0)
     target = 1.0 / bias.shape[0]
-    return bias + lr * jnp.sign(target - load)
+    updated = bias + lr * jnp.sign(target - load)
+    return jnp.where(total > 0, updated, bias)
 
 
 # Note on group-limited routing: implemented inside `_route` (n_groups / topk_groups),
