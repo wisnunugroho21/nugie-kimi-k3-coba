@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kimi-linear-gdn2"
+version = "0.1.0"
+description = "Kimi Linear research model with GDN-2, AttnRes, LatentMoE, and gated MLA"
+requires-python = ">=3.11"
+dependencies = [
+  "flax>=0.12.0",
+  "jax>=0.7.0",
+  "numpy>=2.0",
+  "optax>=0.2.5",
+  "orbax-checkpoint>=0.11.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[tool.setuptools]
+py-modules = ["attention_residual", "kimi_linear_gdn2", "training"]
+
+[tool.setuptools.packages.find]
+include = ["gated_deltanet_2*", "multi_latent_attention*"]
+namespaces = true
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
