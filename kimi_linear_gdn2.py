@@ -122,14 +122,19 @@ class KimiLinearConfig:
 
     # --- Channel mixer (FFN) ---
     moe_d_ff: int = 512  # per-expert hidden width (paper: 1408 at 1.3B)
-    moe_n_routed: int = 8  # number of routed experts E (paper: 256)
+    # Baseline standard-MoE expert counts N and K. ``moe_design_mode`` resolves
+    # these into the actual LatentMoE counts using alpha=d_model/moe_latent_dim:
+    #   efficiency (l-MoE_eff): N'=alpha*N, K'=K
+    #   accuracy   (l-MoE_acc): N'=alpha*N, K'=alpha*K (paper-recommended)
+    #   custom:                 N'=N,       K'=K (legacy/manual behavior)
+    moe_design_mode: str = "accuracy"
+    moe_n_routed: int = 8  # baseline N; actual count is moe_effective_n_routed
     moe_n_shared: int = 1  # always-on shared experts
-    moe_top_k: int = 2  # experts activated per token (paper: 8)
+    moe_top_k: int = 2  # baseline K; actual count is moe_effective_top_k
     # Group-limited routing (DeepSeek-V3 / Kimi K2 "node-limited"): experts split
     # into moe_n_groups groups; each token draws its top-k only from its
-    # moe_topk_groups best groups (at scale: bounds all-to-all traffic). 8 experts
-    # in 4 groups, top-2 groups mirrors V3's half-the-groups ratio. Constraints:
-    # moe_n_routed % moe_n_groups == 0 and moe_top_k <= moe_topk_groups * group size.
+    # moe_topk_groups best groups (at scale: bounds all-to-all traffic). Constraints
+    # are checked against the resolved N' and K', not merely the baseline N and K.
     # Set moe_n_groups = 1 to disable.
     moe_n_groups: int = 4
     moe_topk_groups: int = 2
@@ -174,6 +179,10 @@ class KimiLinearConfig:
                 raise ValueError(f"{name} must be positive, got {value}")
         if self.attnres_mode not in {"none", "full", "block"}:
             raise ValueError("attnres_mode must be 'none', 'full', or 'block'")
+        if self.moe_design_mode not in {"efficiency", "accuracy", "custom"}:
+            raise ValueError(
+                "moe_design_mode must be 'efficiency', 'accuracy', or 'custom'"
+            )
         if self.attnres_block_size < 1:
             raise ValueError("attnres_block_size must be positive")
         if self.moe_latent_dim is not None and not (
@@ -193,14 +202,27 @@ class KimiLinearConfig:
             )
         if self.mla_num_q_heads % self.mla_num_kv_heads != 0:
             raise ValueError("mla_num_q_heads must be divisible by mla_num_kv_heads")
-        if self.moe_n_routed % self.moe_n_groups != 0:
-            raise ValueError("moe_n_routed must be divisible by moe_n_groups")
+        if (
+            self.moe_design_mode != "custom"
+            and self.moe_latent_dim is not None
+            and self.d_model % self.moe_latent_dim != 0
+        ):
+            raise ValueError(
+                "Preset LatentMoE modes require d_model to be divisible by "
+                "moe_latent_dim so alpha is an integer; use custom for manual counts"
+            )
+        effective_n = self.moe_effective_n_routed
+        effective_k = self.moe_effective_top_k
+        if effective_n % self.moe_n_groups != 0:
+            raise ValueError(
+                "Resolved routed expert count must be divisible by moe_n_groups"
+            )
         if self.moe_topk_groups > self.moe_n_groups:
             raise ValueError("moe_topk_groups cannot exceed moe_n_groups")
-        group_size = self.moe_n_routed // self.moe_n_groups
-        if self.moe_top_k > self.moe_topk_groups * group_size:
+        group_size = effective_n // self.moe_n_groups
+        if effective_k > self.moe_topk_groups * group_size:
             raise ValueError(
-                "moe_top_k exceeds the experts available in selected groups"
+                "Resolved top-k exceeds the experts available in selected groups"
             )
         if self.rms_eps <= 0:
             raise ValueError("rms_eps must be positive")
@@ -210,6 +232,94 @@ class KimiLinearConfig:
     @property
     def cdtype(self) -> jnp.dtype:
         return jnp.dtype(self.compute_dtype)
+
+    @property
+    def moe_compression_ratio(self) -> float:
+        """Latent compression alpha=d_model/latent_dim (1 without compression)."""
+        if self.moe_latent_dim is None:
+            return 1.0
+        return self.d_model / self.moe_latent_dim
+
+    @property
+    def _moe_preset_scale(self) -> int:
+        if self.moe_design_mode == "custom" or self.moe_latent_dim is None:
+            return 1
+        return self.d_model // self.moe_latent_dim
+
+    @property
+    def moe_effective_n_routed(self) -> int:
+        """Actual number of routed experts instantiated in each decoder layer."""
+        return self.moe_n_routed * self._moe_preset_scale
+
+    @property
+    def moe_effective_top_k(self) -> int:
+        """Actual number of routed experts activated per token."""
+        scale = self._moe_preset_scale if self.moe_design_mode == "accuracy" else 1
+        return self.moe_top_k * scale
+
+    def moe_design_report(self) -> dict[str, str | int | float]:
+        """Resolve the design and estimate per-layer parameters/FLOPs.
+
+        FLOPs count a multiply-add as two operations and exclude routing/sorting,
+        nonlinearities, and communication. The baseline is a standard full-width
+        MoE using the configured baseline N and K.
+        """
+        latent = self.d_model if self.moe_latent_dim is None else self.moe_latent_dim
+        actual_n = self.moe_effective_n_routed
+        actual_k = self.moe_effective_top_k
+
+        routed_params = 3 * actual_n * latent * self.moe_d_ff
+        projection_params = (
+            0
+            if self.moe_latent_dim is None
+            else 2 * self.d_model * latent
+        )
+        router_params = self.d_model * actual_n
+        shared_params = (
+            3 * self.d_model * self.moe_d_ff * self.moe_n_shared
+        )
+        total_params = (
+            routed_params + projection_params + router_params + shared_params
+        )
+
+        routed_flops = 6 * actual_k * latent * self.moe_d_ff
+        projection_flops = (
+            0
+            if self.moe_latent_dim is None
+            else 4 * self.d_model * latent
+        )
+        router_flops = 2 * self.d_model * actual_n
+        shared_flops = (
+            6 * self.d_model * self.moe_d_ff * self.moe_n_shared
+        )
+        total_flops = (
+            routed_flops + projection_flops + router_flops + shared_flops
+        )
+
+        baseline_params = (
+            3 * self.moe_n_routed * self.d_model * self.moe_d_ff
+            + self.d_model * self.moe_n_routed
+            + shared_params
+        )
+        baseline_flops = (
+            6 * self.moe_top_k * self.d_model * self.moe_d_ff
+            + 2 * self.d_model * self.moe_n_routed
+            + shared_flops
+        )
+        return {
+            "mode": self.moe_design_mode,
+            "compression_ratio": self.moe_compression_ratio,
+            "baseline_n_routed": self.moe_n_routed,
+            "baseline_top_k": self.moe_top_k,
+            "effective_n_routed": actual_n,
+            "effective_top_k": actual_k,
+            "estimated_parameters_per_layer": total_params,
+            "estimated_parameters_all_moe_layers": total_params * self.n_layers,
+            "estimated_flops_per_token_per_layer": total_flops,
+            "estimated_flops_per_token_all_moe_layers": total_flops * self.n_layers,
+            "parameter_ratio_vs_standard_moe": total_params / baseline_params,
+            "flop_ratio_vs_standard_moe": total_flops / baseline_flops,
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -282,9 +392,9 @@ class DecoderLayer(nnx.Module):
         self.channel_mixer = moe_cls(
             d_model=cfg.d_model,
             d_ff=cfg.moe_d_ff,
-            n_routed=cfg.moe_n_routed,
+            n_routed=cfg.moe_effective_n_routed,
             n_shared=cfg.moe_n_shared,
-            top_k=cfg.moe_top_k,
+            top_k=cfg.moe_effective_top_k,
             n_groups=cfg.moe_n_groups,
             topk_groups=cfg.moe_topk_groups,
             compute_dtype=cfg.cdtype,

@@ -22,8 +22,32 @@ KimiLinearConfig(
     attnres_mode="block",      # "block", "full", or "none"
     attnres_block_size=4,      # counts sublayers; decoder layer = 2 sublayers
     moe_latent_dim=64,         # None restores full-width routed experts
+    moe_design_mode="accuracy", # "accuracy", "efficiency", or "custom"
     mla_gated=True,
 )
+```
+
+### LatentMoE design modes
+
+`moe_n_routed` and `moe_top_k` describe the baseline standard-MoE values `N`
+and `K`. With compression `alpha = d_model / moe_latent_dim`, the mode resolves
+the experts actually instantiated:
+
+| Mode | Routed experts | Active experts | Intended tradeoff |
+| --- | ---: | ---: | --- |
+| `efficiency` | `alpha * N` | `K` | Lower active expert cost |
+| `accuracy` | `alpha * N` | `alpha * K` | Higher accuracy at comparable baseline cost |
+| `custom` | `N` | `K` | Literal counts and legacy checkpoint compatibility |
+
+`accuracy` is the default and the paper-recommended LatentMoE configuration.
+Preset modes require an integer compression ratio. Inspect the resolved design
+before constructing a large model:
+
+```python
+report = KimiLinearConfig().moe_design_report()
+print(report["effective_n_routed"], report["effective_top_k"])
+print(report["estimated_parameters_per_layer"])
+print(report["estimated_flops_per_token_per_layer"])
 ```
 
 ## Padding-aware and packed-sequence training

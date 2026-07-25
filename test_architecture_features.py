@@ -32,6 +32,7 @@ def tiny_config(**overrides) -> KimiLinearConfig:
         mla_head_dim=4,
         max_seq_len=8,
         moe_d_ff=12,
+        moe_design_mode="custom",
         moe_n_routed=4,
         moe_n_shared=1,
         moe_top_k=2,
@@ -81,6 +82,66 @@ def test_latent_moe_sparse_dispatch_matches_dense_reference():
     assert moe.w_out[...].shape == (4, 6, 3)
     assert jnp.allclose(sparse, dense, rtol=2e-5, atol=2e-5)
     assert int(aux["group_sizes"].sum()) == 2 * 3 * 2
+
+
+@pytest.mark.parametrize(
+    "mode, expected_experts, expected_top_k",
+    [
+        ("efficiency", 16, 2),
+        ("accuracy", 16, 8),
+        ("custom", 4, 2),
+    ],
+)
+def test_latent_moe_design_modes_resolve_counts(mode, expected_experts, expected_top_k):
+    config = tiny_config(moe_design_mode=mode)
+    model = KimiLinear(config, rngs=nnx.Rngs(27))
+
+    assert config.moe_compression_ratio == 4
+    assert config.moe_effective_n_routed == expected_experts
+    assert config.moe_effective_top_k == expected_top_k
+    for layer in model.layers:
+        assert layer.channel_mixer.E == expected_experts
+        assert layer.channel_mixer.top_k == expected_top_k
+
+
+def test_latent_moe_design_report_exposes_cost_tradeoff():
+    default = KimiLinearConfig()
+    efficiency_config = tiny_config(moe_design_mode="efficiency")
+    accuracy_config = tiny_config(moe_design_mode="accuracy")
+    efficiency = efficiency_config.moe_design_report()
+    accuracy = accuracy_config.moe_design_report()
+    custom = tiny_config(moe_design_mode="custom").moe_design_report()
+    model = KimiLinear(accuracy_config, rngs=nnx.Rngs(28))
+    actual_params = sum(
+        leaf.size
+        for leaf in jax.tree.leaves(
+            nnx.state(model.layers[0].channel_mixer, nnx.Param)
+        )
+    )
+
+    assert default.moe_design_mode == "accuracy"
+    assert default.moe_effective_n_routed == 32
+    assert default.moe_effective_top_k == 8
+    assert efficiency["effective_n_routed"] == accuracy["effective_n_routed"] == 16
+    assert efficiency["effective_top_k"] == 2
+    assert accuracy["effective_top_k"] == 8
+    assert (
+        efficiency["estimated_parameters_per_layer"]
+        == accuracy["estimated_parameters_per_layer"]
+    )
+    assert (
+        accuracy["estimated_flops_per_token_per_layer"]
+        > efficiency["estimated_flops_per_token_per_layer"]
+    )
+    assert (
+        custom["estimated_parameters_per_layer"]
+        < efficiency["estimated_parameters_per_layer"]
+    )
+    assert accuracy["estimated_parameters_per_layer"] == actual_params
+    assert (
+        accuracy["estimated_parameters_all_moe_layers"]
+        == actual_params * accuracy_config.n_layers
+    )
 
 
 def test_gated_mla_full_and_cached_prefill_match():
@@ -208,6 +269,7 @@ def test_nonzero_block_attnres_matches_token_by_token_streaming():
         ({"gdn_chunk_size": 0}, "gdn_chunk_size must be positive"),
         ({"mla_num_kv_heads": 0}, "mla_num_kv_heads must be positive"),
         ({"moe_top_k": 0}, "moe_top_k must be positive"),
+        ({"moe_design_mode": "fast"}, "moe_design_mode"),
         ({"compute_dtype": "float16"}, "compute_dtype"),
     ],
 )
@@ -225,6 +287,15 @@ def test_generation_validates_token_count_and_cache_capacity():
         model.generate(prompt, -1)
     with pytest.raises(ValueError, match="too small"):
         model.generate(prompt, 3, max_len=3)
+
+
+def test_latent_moe_presets_require_integer_compression_ratio():
+    with pytest.raises(ValueError, match="alpha is an integer"):
+        tiny_config(
+            d_model=15,
+            moe_latent_dim=4,
+            moe_design_mode="accuracy",
+        )
 
 
 def test_all_new_parameters_receive_finite_gradients():
