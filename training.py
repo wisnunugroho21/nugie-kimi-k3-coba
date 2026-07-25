@@ -1,4 +1,4 @@
-"""Padding-aware language-model training utilities for :mod:`kimi_linear_gdn2`.
+"""Padding- and packing-aware training utilities for :mod:`kimi_linear_gdn2`.
 
 The public pipeline is intentionally small:
 
@@ -6,9 +6,9 @@ The public pipeline is intentionally small:
     optimizer = create_optimizer(model, TrainingConfig())
     metrics = train_step(model, optimizer, batch)
 
-`make_lm_batch` right-pads and shifts raw token sequences. The same mask is used
-for model state transitions and for the token loss, so padding is not merely
-ignored at the final reduction.
+`make_lm_batch` right-pads raw sequences; `make_packed_lm_batch` greedily combines
+documents and emits segment IDs. The masks are enforced inside the model as well
+as at the loss, so neither padding nor earlier packed documents leak into a token.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import dataclasses
 import json
 from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -31,11 +31,12 @@ from multi_latent_attention.moe import update_router_bias
 
 
 class LMBatch(TypedDict):
-    """A right-padded, next-token-prediction batch."""
+    """A padded or packed next-token-prediction batch."""
 
     input_ids: jax.Array
     labels: jax.Array
     attention_mask: jax.Array
+    segment_ids: NotRequired[jax.Array]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -120,6 +121,83 @@ def make_lm_batch(
     }
 
 
+def make_packed_lm_batch(
+    token_sequences: Sequence[Sequence[int] | np.ndarray | jax.Array],
+    *,
+    pad_token_id: int,
+    max_seq_len: int,
+    dtype: jnp.dtype = jnp.int32,
+) -> LMBatch:
+    """Greedily pack independent sequences into fixed-length training rows.
+
+    Next-token pairs are formed *before* packing, so the final token of one
+    document is never trained to predict the first token of the next. Sequences
+    longer than the context are truncated to ``max_seq_len + 1`` source tokens;
+    shorter sequences are packed whole and never split across rows.
+    """
+    if not token_sequences:
+        raise ValueError("token_sequences cannot be empty")
+    if max_seq_len < 1:
+        raise ValueError("max_seq_len must be positive")
+
+    examples: list[np.ndarray] = []
+    for index, sequence in enumerate(token_sequences):
+        array = np.asarray(sequence)
+        if array.ndim != 1:
+            raise ValueError(f"sequence {index} must be one-dimensional")
+        if array.size < 2:
+            raise ValueError(
+                f"sequence {index} needs at least two tokens for next-token training"
+            )
+        if not np.issubdtype(array.dtype, np.integer):
+            raise TypeError(f"sequence {index} must contain integer token ids")
+        examples.append(
+            array[: max_seq_len + 1].astype(np.int32, copy=False)
+        )
+
+    packed_rows: list[list[np.ndarray]] = []
+    current_row: list[np.ndarray] = []
+    current_length = 0
+    for example in examples:
+        pair_count = example.size - 1
+        if current_row and current_length + pair_count > max_seq_len:
+            packed_rows.append(current_row)
+            current_row = []
+            current_length = 0
+        current_row.append(example)
+        current_length += pair_count
+    if current_row:
+        packed_rows.append(current_row)
+
+    batch_size = len(packed_rows)
+    input_ids = np.full(
+        (batch_size, max_seq_len), pad_token_id, dtype=np.int32
+    )
+    labels = np.full(
+        (batch_size, max_seq_len), pad_token_id, dtype=np.int32
+    )
+    attention_mask = np.zeros((batch_size, max_seq_len), dtype=np.bool_)
+    segment_ids = np.full((batch_size, max_seq_len), -1, dtype=np.int32)
+
+    for row_index, row in enumerate(packed_rows):
+        offset = 0
+        for segment_id, example in enumerate(row):
+            pair_count = example.size - 1
+            end = offset + pair_count
+            input_ids[row_index, offset:end] = example[:-1]
+            labels[row_index, offset:end] = example[1:]
+            attention_mask[row_index, offset:end] = True
+            segment_ids[row_index, offset:end] = segment_id
+            offset = end
+
+    return {
+        "input_ids": jnp.asarray(input_ids, dtype=dtype),
+        "labels": jnp.asarray(labels, dtype=dtype),
+        "attention_mask": jnp.asarray(attention_mask),
+        "segment_ids": jnp.asarray(segment_ids),
+    }
+
+
 def create_optimizer(
     model: KimiLinear, config: TrainingConfig
 ) -> nnx.Optimizer:
@@ -147,10 +225,17 @@ def language_model_loss(
     input_ids = batch["input_ids"]
     labels = batch["labels"]
     attention_mask = batch["attention_mask"]
+    segment_ids = batch.get("segment_ids")
     if labels.shape != input_ids.shape or attention_mask.shape != input_ids.shape:
         raise ValueError("input_ids, labels, and attention_mask must have equal shapes")
+    if segment_ids is not None and segment_ids.shape != input_ids.shape:
+        raise ValueError("segment_ids must have the same shape as input_ids")
 
-    logits, aux = model(input_ids, attention_mask=attention_mask)
+    logits, aux = model(
+        input_ids,
+        attention_mask=attention_mask,
+        segment_ids=segment_ids,
+    )
     valid = attention_mask.astype(bool)
     safe_labels = jnp.where(valid, labels, 0)
     per_token_loss = optax.softmax_cross_entropy_with_integer_labels(

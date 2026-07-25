@@ -282,3 +282,50 @@ def recurrent_gated_delta_rule_2(
 ) -> tuple[jax.Array, jax.Array]:
     """Token-by-token reference forward, same I/O as the chunkwise version."""
     return _batchify(_recurrent_single)(q, k, v, g, b, w, S0)
+
+
+def recurrent_gated_delta_rule_2_segmented(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    g: jax.Array,
+    b: jax.Array,
+    w: jax.Array,
+    S0: jax.Array,
+    reset_mask: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Recurrent forward with independent packed-sequence segments.
+
+    Inputs use the regular ``[B, H, L, d]`` layout. ``reset_mask[B, L]`` is true
+    on the first valid token of every packed segment. The state is zeroed before
+    processing those tokens, preventing information from crossing document
+    boundaries while keeping the recurrence fully JIT-compatible.
+    """
+    if reset_mask.shape != (q.shape[0], q.shape[2]):
+        raise ValueError(
+            "reset_mask must have shape "
+            f"{(q.shape[0], q.shape[2])}, got {reset_mask.shape}"
+        )
+
+    e = (b.astype(D_TYPE) * k.astype(D_TYPE)).transpose(2, 0, 1, 3)
+    z = (w.astype(D_TYPE) * v.astype(D_TYPE)).transpose(2, 0, 1, 3)
+    q = q.astype(D_TYPE).transpose(2, 0, 1, 3)
+    k = k.astype(D_TYPE).transpose(2, 0, 1, 3)
+    alpha = jnp.exp(g.astype(D_TYPE)).transpose(2, 0, 1, 3)
+    resets = reset_mask.astype(bool).swapaxes(0, 1)
+
+    def step(state, inputs):
+        qt, kt, at, et, zt, reset = inputs
+        state = jnp.where(reset[:, None, None, None], 0, state)
+        state_bar = at[..., :, None] * state
+        old_value = jnp.einsum("bhkd,bhk->bhd", state_bar, et)
+        state_new = state_bar + kt[..., :, None] * (
+            zt - old_value
+        )[..., None, :]
+        output = jnp.einsum("bhkd,bhk->bhd", state_new, qt)
+        return state_new, output
+
+    final_state, output = lax.scan(
+        step, S0.astype(D_TYPE), (q, k, alpha, e, z, resets)
+    )
+    return output.transpose(1, 2, 0, 3), final_state

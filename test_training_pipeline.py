@@ -14,6 +14,7 @@ from training import (
     create_optimizer,
     language_model_loss,
     make_lm_batch,
+    make_packed_lm_batch,
     restore_checkpoint,
     save_checkpoint,
     train_step,
@@ -32,6 +33,31 @@ def test_make_lm_batch_shifts_truncates_and_right_pads():
     assert batch["attention_mask"].tolist() == [
         [True, True, True],
         [True, True, False],
+    ]
+
+
+def test_make_packed_lm_batch_preserves_document_targets_and_boundaries():
+    batch = make_packed_lm_batch(
+        [[1, 2, 3, 4], [5, 6, 7], [8, 9]],
+        pad_token_id=31,
+        max_seq_len=4,
+    )
+
+    assert batch["input_ids"].tolist() == [
+        [1, 2, 3, 31],
+        [5, 6, 8, 31],
+    ]
+    assert batch["labels"].tolist() == [
+        [2, 3, 4, 31],
+        [6, 7, 9, 31],
+    ]
+    assert batch["attention_mask"].tolist() == [
+        [True, True, True, False],
+        [True, True, True, False],
+    ]
+    assert batch["segment_ids"].tolist() == [
+        [0, 0, 0, -1],
+        [0, 0, 1, -1],
     ]
 
 
@@ -56,6 +82,46 @@ def test_padding_does_not_change_valid_logits_or_moe_counts(attnres_mode):
     assert jnp.all(aux["group_sizes"].sum(axis=-1) == expected_assignments)
 
 
+@pytest.mark.parametrize("attnres_mode", ["none", "full", "block"])
+def test_packed_segments_match_independent_forwards(attnres_mode):
+    model = KimiLinear(
+        tiny_config(attnres_mode=attnres_mode),
+        rngs=nnx.Rngs(24),
+    )
+    packed = make_packed_lm_batch(
+        [[1, 2, 3, 4], [5, 6, 7]],
+        pad_token_id=31,
+        max_seq_len=6,
+    )
+
+    packed_logits, _ = model(
+        packed["input_ids"],
+        attention_mask=packed["attention_mask"],
+        segment_ids=packed["segment_ids"],
+    )
+    first_logits, _ = model(jnp.array([[1, 2, 3]], jnp.int32))
+    second_logits, _ = model(jnp.array([[5, 6]], jnp.int32))
+
+    assert jnp.allclose(packed_logits[0, :3], first_logits[0], atol=3e-5, rtol=3e-5)
+    assert jnp.allclose(packed_logits[0, 3:5], second_logits[0], atol=3e-5, rtol=3e-5)
+    assert jnp.all(packed_logits[0, 5:] == 0)
+
+
+def test_later_packed_segment_is_independent_of_earlier_tokens():
+    model = KimiLinear(tiny_config(), rngs=nnx.Rngs(25))
+    mask = jnp.array([[1, 1, 1, 1, 1]], dtype=bool)
+    segments = jnp.array([[0, 0, 0, 1, 1]], dtype=jnp.int32)
+    first = jnp.array([[1, 2, 3, 9, 10]], dtype=jnp.int32)
+    changed = jnp.array([[20, 21, 22, 9, 10]], dtype=jnp.int32)
+
+    first_logits, _ = model(first, attention_mask=mask, segment_ids=segments)
+    changed_logits, _ = model(changed, attention_mask=mask, segment_ids=segments)
+
+    assert jnp.allclose(
+        first_logits[:, 3:], changed_logits[:, 3:], atol=3e-5, rtol=3e-5
+    )
+
+
 def test_masked_loss_has_finite_gradients_and_no_pad_embedding_gradient():
     model = KimiLinear(tiny_config(), rngs=nnx.Rngs(21))
     batch = make_lm_batch([[1, 2, 3, 4], [5, 6]], pad_token_id=31)
@@ -69,6 +135,29 @@ def test_masked_loss_has_finite_gradients_and_no_pad_embedding_gradient():
     assert jnp.isfinite(loss)
     assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in leaves)
     assert jnp.all(grads["embed"]["embedding"][31] == 0)
+
+
+def test_packed_loss_has_finite_gradients():
+    model = KimiLinear(tiny_config(), rngs=nnx.Rngs(26))
+    batch = make_packed_lm_batch(
+        [[1, 2, 3, 4], [5, 6, 7], [8, 9]],
+        pad_token_id=31,
+        max_seq_len=6,
+    )
+
+    loss, grads = nnx.value_and_grad(
+        lambda current_model: language_model_loss(current_model, batch)[0]
+    )(model)
+
+    assert jnp.isfinite(loss)
+    assert all(
+        bool(jnp.all(jnp.isfinite(leaf))) for leaf in jax.tree.leaves(grads)
+    )
+    optimizer = create_optimizer(model, TrainingConfig())
+    metrics = train_step(model, optimizer, batch)
+    assert int(metrics["step"]) == 1
+    assert jnp.isfinite(metrics["loss"])
+    assert jnp.isfinite(metrics["grad_norm"])
 
 
 def test_train_step_updates_parameters_and_checkpoint_round_trips(tmp_path):

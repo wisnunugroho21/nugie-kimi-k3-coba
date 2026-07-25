@@ -26,13 +26,14 @@ KimiLinearConfig(
 )
 ```
 
-## Padding-aware training
+## Padding-aware and packed-sequence training
 
-`training.py` provides right-padding collation, masked next-token loss, AdamW
-with gradient clipping, MoE router-bias updates, evaluation, and versioned
-model/optimizer checkpoints. Padding is masked inside the architecture: MLA
-cannot attend to padded keys, GDN-2 treats padded recurrence steps as identity
-transitions, and MoE load statistics count only real tokens.
+`training.py` provides right-padding and packed-sequence collation, masked
+next-token loss, AdamW with gradient clipping, MoE router-bias updates,
+evaluation, and versioned model/optimizer checkpoints. Padding and document
+boundaries are enforced inside the architecture: MLA cannot attend across
+segments, GDN-2 resets both its recurrent state and short convolution at each
+segment, and MoE load statistics count only real tokens.
 
 ```python
 from flax import nnx
@@ -42,6 +43,7 @@ from training import (
     TrainingConfig,
     create_optimizer,
     make_lm_batch,
+    make_packed_lm_batch,
     save_checkpoint,
     train_step,
 )
@@ -54,6 +56,14 @@ optimizer = create_optimizer(model, training_config)
 # Raw token sequences include both the first input and final prediction target.
 batch = make_lm_batch(
     [[1, 2, 3, 4], [5, 6]],
+    pad_token_id=0,
+    max_seq_len=model_config.max_seq_len,
+)
+
+# Or greedily combine documents into fixed-size rows. Targets are shifted before
+# packing, so one document is never trained to predict the next document.
+packed_batch = make_packed_lm_batch(
+    [[1, 2, 3, 4], [5, 6], [7, 8, 9]],
     pad_token_id=0,
     max_seq_len=model_config.max_seq_len,
 )
@@ -76,7 +86,13 @@ save_checkpoint(
 
 Use `train_epoch(...)` and `evaluate(...)` for iterables of pre-collated batches.
 The model accepts integer or boolean `attention_mask` arrays with the same
-`[batch, length]` shape as `input_ids`.
+`[batch, length]` shape as `input_ids`. Packed batches additionally carry integer
+`segment_ids`; equal IDs identify tokens belonging to the same document within
+each row, while padding uses `-1`.
+
+Packed GDN-2 currently uses the exact token-recurrent scan so it can reset state
+at arbitrary boundaries; unpacked batches retain the faster chunkwise training
+core.
 
 ## Quick check
 

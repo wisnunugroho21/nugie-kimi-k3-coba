@@ -293,10 +293,17 @@ class DecoderLayer(nnx.Module):
         )
 
     def token_delta(
-        self, h: jax.Array, attention_mask: jax.Array | None = None
+        self,
+        h: jax.Array,
+        attention_mask: jax.Array | None = None,
+        segment_ids: jax.Array | None = None,
     ) -> jax.Array:
         """Token-mixer sublayer output without applying a residual merge."""
-        return self.token_mixer(self.norm1(h), attention_mask=attention_mask)
+        return self.token_mixer(
+            self.norm1(h),
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
+        )
 
     def channel_delta(
         self, h: jax.Array, attention_mask: jax.Array | None = None
@@ -305,7 +312,10 @@ class DecoderLayer(nnx.Module):
         return self.channel_mixer(self.norm2(h), token_mask=attention_mask)
 
     def __call__(
-        self, x: jax.Array, attention_mask: jax.Array | None = None
+        self,
+        x: jax.Array,
+        attention_mask: jax.Array | None = None,
+        segment_ids: jax.Array | None = None,
     ) -> tuple[jax.Array, dict[str, jax.Array]]:
         """x: [B, L, d_model] -> (x, aux_or_None).
 
@@ -313,7 +323,7 @@ class DecoderLayer(nnx.Module):
         needs (aux loss + per-expert token counts for the router-bias update).
         """
         # --- token mixing (residual, pre-norm) ---
-        x = x + self.token_delta(x, attention_mask)
+        x = x + self.token_delta(x, attention_mask, segment_ids)
 
         # --- channel mixing (residual, pre-norm) ---
         m, aux = self.channel_delta(x, attention_mask)
@@ -410,13 +420,19 @@ class KimiLinear(nnx.Module):
             )
 
     def __call__(
-        self, input_ids: jax.Array, attention_mask: jax.Array | None = None
+        self,
+        input_ids: jax.Array,
+        attention_mask: jax.Array | None = None,
+        segment_ids: jax.Array | None = None,
     ) -> tuple[jax.Array, dict[str, ArrayLike]]:
         """input_ids: int[B, L] -> (logits[B, L, vocab], aux).
 
         ``attention_mask`` is an optional boolean/numeric ``[B, L]`` array where
         true/one marks real tokens. Padding is excluded from MLA keys, GDN-2 state
         transitions, sublayer outputs, and MoE load-balancing diagnostics.
+        ``segment_ids`` optionally assigns every valid token to a packed sequence;
+        MLA attention, GDN-2 recurrence, and short convolutions cannot cross a
+        change in segment id.
 
         aux is ALWAYS returned (callers that don't need it just unpack `logits, _ =`):
             aux = {"aux_loss":   scalar, the MoE load-balancing loss summed over layers,
@@ -434,6 +450,14 @@ class KimiLinear(nnx.Module):
             )
         else:
             attention_mask = attention_mask.astype(bool)
+        if segment_ids is not None:
+            if segment_ids.shape != input_ids.shape:
+                raise ValueError(
+                    "segment_ids must have the same shape as input_ids, got "
+                    f"{segment_ids.shape} and {input_ids.shape}"
+                )
+            if not jnp.issubdtype(segment_ids.dtype, jnp.integer):
+                raise TypeError("segment_ids must use an integer dtype")
         aux_loss: ArrayLike = 0.0
         group_sizes: list[
             ArrayLike
@@ -443,7 +467,7 @@ class KimiLinear(nnx.Module):
         x = jnp.where(attention_mask[..., None], x, 0)
         if self.cfg.attnres_mode == "none":
             for layer in self.layers:
-                x, aux = layer(x, attention_mask)
+                x, aux = layer(x, attention_mask, segment_ids)
                 aux_loss = aux_loss + aux["aux_loss"]
                 group_sizes.append(aux["group_sizes"])
         elif self.cfg.attnres_mode == "full":
@@ -453,7 +477,9 @@ class KimiLinear(nnx.Module):
                 assert layer.channel_residual is not None
 
                 h = layer.token_residual(values)
-                values.append(layer.token_delta(h, attention_mask))
+                values.append(
+                    layer.token_delta(h, attention_mask, segment_ids)
+                )
 
                 h = layer.channel_residual(values)
                 delta, aux = layer.channel_delta(h, attention_mask)
@@ -478,7 +504,7 @@ class KimiLinear(nnx.Module):
 
                 sources = completed if partial is None else [*completed, partial]
                 h = layer.token_residual(sources)
-                delta = layer.token_delta(h, attention_mask)
+                delta = layer.token_delta(h, attention_mask, segment_ids)
                 partial = delta if partial is None else partial + delta
                 sublayer_idx += 1
                 if sublayer_idx % self.cfg.attnres_block_size == 0:

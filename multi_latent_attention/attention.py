@@ -160,7 +160,10 @@ class GroupedQueryLatentAttention(nnx.Module):
         return self.w_uv_o(weighted_latents.astype(self.compute_dtype))
 
     def __call__(
-        self, x: jax.Array, attention_mask: jax.Array | None = None
+        self,
+        x: jax.Array,
+        attention_mask: jax.Array | None = None,
+        segment_ids: jax.Array | None = None,
     ) -> jax.Array:
         """Full-sequence causal attention.
 
@@ -168,6 +171,8 @@ class GroupedQueryLatentAttention(nnx.Module):
         are excluded as keys and produce an all-zero mixer delta as queries. The
         diagonal fallback for masked queries keeps softmax rows finite while the
         final output mask guarantees those rows cannot enter the residual stream.
+        When supplied, integer ``segment_ids[B, T]`` also prevent attention across
+        packed-document boundaries.
         """
         # x: (B, T, embed_dim)
         batch_size, seq_length, _ = x.shape
@@ -180,6 +185,14 @@ class GroupedQueryLatentAttention(nnx.Module):
                     f"{(batch_size, seq_length)}, got {attention_mask.shape}"
                 )
             valid = attention_mask.astype(bool)
+        if segment_ids is not None:
+            if segment_ids.shape != (batch_size, seq_length):
+                raise ValueError(
+                    "segment_ids must have shape "
+                    f"{(batch_size, seq_length)}, got {segment_ids.shape}"
+                )
+            if not jnp.issubdtype(segment_ids.dtype, jnp.integer):
+                raise TypeError("segment_ids must use an integer dtype")
         x = jnp.where(valid[..., None], x, 0)
 
         # --- Queries (already in the compressed K space via the absorbed W_UK) ---
@@ -223,7 +236,26 @@ class GroupedQueryLatentAttention(nnx.Module):
         # the module state or in checkpoints. Safe to use -inf because the diagonal
         # is always kept (no fully-masked rows -> the softmax cannot NaN).
         causal_mask = jnp.tril(jnp.ones((seq_length, seq_length), dtype=bool))
-        mask = causal_mask[None, :, :] & valid[:, None, :]
+        mask = (
+            causal_mask[None, :, :]
+            & valid[:, :, None]
+            & valid[:, None, :]
+        )
+        if segment_ids is not None:
+            previous_valid = jnp.pad(valid[:, :-1], ((0, 0), (1, 0)))
+            previous_segment = jnp.pad(
+                segment_ids[:, :-1], ((0, 0), (1, 0))
+            )
+            segment_start = valid & (
+                (~previous_valid) | (segment_ids != previous_segment)
+            )
+            # Canonicalize IDs into contiguous runs. This prevents a reused raw
+            # ID after a boundary from reconnecting to an earlier segment.
+            segment_run = jnp.cumsum(segment_start, axis=1)
+            same_segment = (
+                segment_run[:, :, None] == segment_run[:, None, :]
+            )
+            mask = mask & same_segment
         # A masked query may otherwise have no valid keys (for example left
         # padding). Retaining its diagonal yields a finite, disposable softmax row.
         diagonal = jnp.eye(seq_length, dtype=bool)[None, :, :]

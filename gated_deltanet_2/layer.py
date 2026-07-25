@@ -41,6 +41,7 @@ import jax.numpy as jnp
 from gated_deltanet_2.core import (
     chunkwise_gated_delta_rule_2,
     recurrent_gated_delta_rule_2,
+    recurrent_gated_delta_rule_2_segmented,
 )
 
 F32 = jnp.float32
@@ -200,10 +201,53 @@ class ShortConv(nnx.Module):
         return y, new_state  # [B, L, C]
 
     def __call__(
-        self, x: jax.Array
+        self, x: jax.Array, segment_ids: jax.Array | None = None
     ) -> jax.Array:  # full-sequence (training) path; left context = zeros
+        if segment_ids is not None:
+            return self._segmented(x, segment_ids)
         y, _ = self._apply(x, conv_state=None)
         return y
+
+    def _segmented(self, x: jax.Array, segment_ids: jax.Array) -> jax.Array:
+        """Causal depthwise convolution that cannot cross packed boundaries."""
+        B, L, _ = x.shape
+        if segment_ids.shape != (B, L):
+            raise ValueError(
+                f"segment_ids must have shape {(B, L)}, got {segment_ids.shape}"
+            )
+
+        kernel = self.conv.kernel[...].astype(x.dtype)[:, 0, :]
+        output = jnp.zeros_like(x)
+        for kernel_index in range(self.kernel_size):
+            shift = self.kernel_size - 1 - kernel_index
+            shifted_x = jnp.pad(x, ((0, 0), (shift, 0), (0, 0)))[:, :L]
+            shifted_segments = jnp.pad(
+                segment_ids, ((0, 0), (shift, 0)), constant_values=0
+            )[:, :L]
+            source_exists = jnp.arange(L) >= shift
+            same_segment = (
+                segment_ids == shifted_segments
+            ) & source_exists[None, :]
+            # Matching endpoint IDs are insufficient if an invalid token or a
+            # different segment lies between them. Require the whole convolution
+            # window from the source through the current token to be one run.
+            for intermediate_shift in range(shift):
+                intermediate_segments = jnp.pad(
+                    segment_ids,
+                    ((0, 0), (intermediate_shift, 0)),
+                    constant_values=0,
+                )[:, :L]
+                same_segment = same_segment & (
+                    segment_ids == intermediate_segments
+                )
+            output = output + (
+                shifted_x
+                * same_segment[..., None]
+                * kernel[kernel_index][None, None, :]
+            )
+        if self.conv.bias is not None:
+            output = output + self.conv.bias[...].astype(x.dtype)
+        return output
 
     def step(
         self, x: jax.Array, conv_state: jax.Array
@@ -361,7 +405,10 @@ class GatedDeltaNet2(nnx.Module):
         return x.reshape(B, L, self.Hv, self.dv).swapaxes(1, 2)  # [B,Hv,L,dv]
 
     def _project(
-        self, x: jax.Array, conv_states: tuple[jax.Array, jax.Array, jax.Array] | None
+        self,
+        x: jax.Array,
+        conv_states: tuple[jax.Array, jax.Array, jax.Array] | None,
+        segment_ids: jax.Array | None = None,
     ) -> tuple[
         jax.Array,
         jax.Array,
@@ -381,9 +428,9 @@ class GatedDeltaNet2(nnx.Module):
 
         # q,k,v paths: Linear -> ShortConv -> SiLU (Sec. 3.5; Fig. 1 caption).
         if conv_states is None:  # full/training: conv pads with zeros (causal)
-            q = self.q_conv(self.q_proj(x))
-            k = self.k_conv(self.k_proj(x))
-            v = self.v_conv(self.v_proj(x))
+            q = self.q_conv(self.q_proj(x), segment_ids=segment_ids)
+            k = self.k_conv(self.k_proj(x), segment_ids=segment_ids)
+            v = self.v_conv(self.v_proj(x), segment_ids=segment_ids)
             new_conv = None
         else:  # streaming: conv uses the cached left context and returns a new one
             qcs, kcs, vcs = conv_states
@@ -452,14 +499,16 @@ class GatedDeltaNet2(nnx.Module):
         x: jax.Array,
         initial_state: jax.Array | None = None,
         attention_mask: jax.Array | None = None,
+        segment_ids: jax.Array | None = None,
     ) -> jax.Array:
         """Full-sequence training forward with a chunkwise prefix and ragged tail.
         x: [B, L, d_model] -> out: [B, L, d_model].
 
-        A chunk-aligned prefix uses the parallel core and any remaining tokens use
-        the exact recurrent rule. Training therefore supports arbitrary non-empty
-        sequence lengths while retaining the fast chunkwise path. The final state is
-        discarded; `initial_state` can optionally warm-start the recurrence."""
+        Without packed ``segment_ids``, a chunk-aligned prefix uses the parallel
+        core and any remaining tokens use the exact recurrent rule. Packed inputs
+        use the recurrent core so state can reset exactly at every segment boundary.
+        The final state is discarded; ``initial_state`` can optionally warm-start
+        the recurrence."""
         B, L, _ = x.shape
         if L < 1:
             raise ValueError("GatedDeltaNet2 requires at least one input token")
@@ -472,11 +521,33 @@ class GatedDeltaNet2(nnx.Module):
                     f"got {attention_mask.shape}"
                 )
             valid = attention_mask.astype(bool)
+        if segment_ids is not None:
+            if segment_ids.shape != (B, L):
+                raise ValueError(
+                    f"segment_ids must have shape {(B, L)}, got {segment_ids.shape}"
+                )
+            if not jnp.issubdtype(segment_ids.dtype, jnp.integer):
+                raise TypeError("segment_ids must use an integer dtype")
+            previous_valid = jnp.pad(valid[:, :-1], ((0, 0), (1, 0)))
+            previous_segment = jnp.pad(
+                segment_ids[:, :-1], ((0, 0), (1, 0))
+            )
+            segment_start = valid & (
+                (~previous_valid) | (segment_ids != previous_segment)
+            )
+            segment_run = jnp.where(
+                valid, jnp.cumsum(segment_start, axis=1), -1
+            )
+        else:
+            segment_start = None
+            segment_run = None
 
         # Zeroing the projection input gives left padding the same short-conv
         # history as the causal zero padding at the beginning of a sequence.
         x_masked = jnp.where(valid[..., None], x, 0)
-        q, k, v, g, b, w, _ = self._project(x_masked, conv_states=None)
+        q, k, v, g, b, w, _ = self._project(
+            x_masked, conv_states=None, segment_ids=segment_run
+        )
         step_valid = valid[:, None, :, None]
         # A padded recurrent step must be the identity: alpha=1 (g=0), no erase,
         # no write, and no read. This is stronger than merely masking the loss.
@@ -490,36 +561,41 @@ class GatedDeltaNet2(nnx.Module):
         if initial_state is None:
             initial_state = jnp.zeros((B, self.Hv, self.dk, self.dv), jnp.float32)
 
-        n_full = (L // self.chunk_size) * self.chunk_size
-        state = initial_state
-        outputs = []
-
-        if n_full > 0:
-            o_full, state = chunkwise_gated_delta_rule_2(
-                q[:, :, :n_full],
-                k[:, :, :n_full],
-                v[:, :, :n_full],
-                g[:, :, :n_full],
-                b[:, :, :n_full],
-                w[:, :, :n_full],
-                state,
-                chunk_size=self.chunk_size,
+        if segment_start is not None:
+            o, _ = recurrent_gated_delta_rule_2_segmented(
+                q, k, v, g, b, w, initial_state, segment_start
             )
-            outputs.append(o_full)
+        else:
+            n_full = (L // self.chunk_size) * self.chunk_size
+            state = initial_state
+            outputs = []
 
-        if n_full < L:
-            o_tail, _ = recurrent_gated_delta_rule_2(
-                q[:, :, n_full:],
-                k[:, :, n_full:],
-                v[:, :, n_full:],
-                g[:, :, n_full:],
-                b[:, :, n_full:],
-                w[:, :, n_full:],
-                state,
-            )
-            outputs.append(o_tail)
+            if n_full > 0:
+                o_full, state = chunkwise_gated_delta_rule_2(
+                    q[:, :, :n_full],
+                    k[:, :, :n_full],
+                    v[:, :, :n_full],
+                    g[:, :, :n_full],
+                    b[:, :, :n_full],
+                    w[:, :, :n_full],
+                    state,
+                    chunk_size=self.chunk_size,
+                )
+                outputs.append(o_full)
 
-        o = outputs[0] if len(outputs) == 1 else jnp.concatenate(outputs, axis=2)
+            if n_full < L:
+                o_tail, _ = recurrent_gated_delta_rule_2(
+                    q[:, :, n_full:],
+                    k[:, :, n_full:],
+                    v[:, :, n_full:],
+                    g[:, :, n_full:],
+                    b[:, :, n_full:],
+                    w[:, :, n_full:],
+                    state,
+                )
+                outputs.append(o_tail)
+
+            o = outputs[0] if len(outputs) == 1 else jnp.concatenate(outputs, axis=2)
         output = self._output(o, x_masked)
         return jnp.where(valid[..., None], output, 0)
 
