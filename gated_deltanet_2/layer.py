@@ -81,7 +81,7 @@ class RMSNorm(nnx.Module):
         mean = jnp.mean(xf * xf, axis=-1, keepdims=True)
         rms = jax.lax.rsqrt(mean + self.eps)
 
-        return (xf * rms).astype(x.dtype) * self.weight.value
+        return (xf * rms).astype(x.dtype) * self.weight[...]
 
 
 class LowRankLinear(nnx.Module):
@@ -390,8 +390,8 @@ class GatedDeltaNet2(nnx.Module):
         # Log-decay branch, computed in fp32 outside the kernel (Eq. 12 / 86; App. C.1 / D.1).
         #   g_t = -exp(a) ⊙ softplus(Proj_f(x_t) + δ),  then α_t = exp(g_t) inside the core.
         f_p = self.f_proj(x).astype(jnp.float32)  # [B,L,H*dk]  Proj_f(x) in Eq. 86
-        d_t = self.dt_bias.value.astype(jnp.float32)  # [H*dk]  decay bias δ, Eq. 86
-        a_l = self.A_log.value.astype(
+        d_t = self.dt_bias[...].astype(jnp.float32)  # [H*dk]  decay bias δ, Eq. 86
+        a_l = self.A_log[...].astype(
             jnp.float32
         )  # [H, d_k]  log-decay matrix A, Eq. 86
 

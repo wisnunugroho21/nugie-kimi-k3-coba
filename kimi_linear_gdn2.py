@@ -15,21 +15,27 @@ fraction of the KV-cache and compute cost.
   • KDA layers carry positional information implicitly through their recurrence,
     so the full-attention layers need NO positional encoding. Hence the MLA layers
     here are NoPE (see multi_latent_attention/attention.py).
-  • Every layer's channel mixer (FFN) is a DeepSeek-V3 / Moonlight-style MoE.
+  • Every layer's channel mixer is a LatentMoE: routed experts work in a compressed
+    space while routing and the shared expert stay at model width.
+  • Residual streams use Block Attention Residuals (AttnRes), selecting earlier
+    block representations with token-dependent softmax weights over depth.
+  • Full-attention layers use a per-head sigmoid output gate (Gated MLA).
 
 THIS FILE'S ONE DELIBERATE SUBSTITUTION
 ---------------------------------------
 We replace KDA with **Gated DeltaNet-2** ("Decoupling Erase and Write in Linear
 Attention", arXiv:2605.22791). Both are gated-delta-rule linear attentions with
 fine-grained (channel-wise) gating; GDN-2's twist is a separate erase gate `b` and
-write gate `w` instead of the single `beta` that KDA/GDN share. Everything else of
-Kimi Linear — the 3:1 hybrid schedule, NoPE MLA, MoE FFN, pre-norm residual blocks
-— is kept as in the paper. See gated_deltanet_2/layer.py for that token mixer.
+write gate `w` instead of the single `beta` that KDA/GDN share. The 3:1 hybrid
+schedule and NoPE MLA layout are retained, then extended below with AttnRes,
+LatentMoE, and gated MLA. See gated_deltanet_2/layer.py for the linear token mixer.
 
-BLOCK STRUCTURE (standard pre-norm transformer; Fig. 2)
--------------------------------------------------------
-    x = x + TokenMixer(RMSNorm(x))     # TokenMixer = GDN-2 (linear) OR MLA (full)
-    x = x + ChannelMixer(RMSNorm(x))   # ChannelMixer = MoE
+BLOCK STRUCTURE
+---------------
+    h = AttnRes(depth_sources)
+    token_delta = TokenMixer(RMSNorm(h))
+    h = AttnRes(depth_sources + token_delta)
+    mlp_delta = LatentMoE(RMSNorm(h))
 
 MODEL = Embed -> [DecoderLayer] * n_layers -> RMSNorm -> LM head.
 
@@ -47,15 +53,21 @@ from __future__ import annotations
 
 import dataclasses
 
-import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
+from flax import nnx
 from jax.typing import ArrayLike
+
+from attention_residual import AttentionResidual
 
 # Reuse the building blocks already implemented and verified in this repo.
 from gated_deltanet_2.layer import GatedDeltaNet2, GDN2Cache, RMSNorm
-from multi_latent_attention.attention import GroupedQueryLatentAttention, MLACache
-from multi_latent_attention.moe import GroupedGemmMoE
+from multi_latent_attention.attention import (
+    GatedMultiHeadLatentAttention,
+    GroupedQueryLatentAttention,
+    MLACache,
+)
+from multi_latent_attention.moe import GroupedGemmMoE, LatentMoE
 
 # App. D.5: Xavier-uniform init with gain 2^{-2.5} (variance_scaling scale = gain² =
 # 2^{-5}) for the embedding and LM head, replacing Flax NNX's defaults. The (small)
@@ -100,6 +112,14 @@ class KimiLinearConfig:
     # default size of the preallocated MLA latent cache in init_cache/generate.
     # (The MLA causal mask itself is built on the fly from the actual length.)
     max_seq_len: int = 512
+    mla_gated: bool = True
+
+    # --- Attention Residuals ---
+    # "block" is the scalable paper variant, "full" attends to every prior sublayer
+    # output, and "none" restores ordinary additive PreNorm residuals. Block size
+    # counts token-mixer and channel-mixer sublayers (two per decoder layer).
+    attnres_mode: str = "block"
+    attnres_block_size: int = 4
 
     # --- Channel mixer (FFN) ---
     moe_d_ff: int = 512  # per-expert hidden width (paper: 1408 at 1.3B)
@@ -114,6 +134,9 @@ class KimiLinearConfig:
     # Set moe_n_groups = 1 to disable.
     moe_n_groups: int = 4
     moe_topk_groups: int = 2
+    # LatentMoE routed width. The recommended paper compression ratio is 4x;
+    # router inputs and shared experts remain at full d_model width.
+    moe_latent_dim: int | None = 64
 
     rms_eps: float = 1e-5
 
@@ -124,6 +147,20 @@ class KimiLinearConfig:
     # softmax, and the loss. Set "bfloat16" on an H200; "float32" disables mixed
     # precision. Read from YAML as a string; use `.cdtype` for the resolved dtype.
     compute_dtype: str = "float32"
+
+    def __post_init__(self):
+        if self.attnres_mode not in {"none", "full", "block"}:
+            raise ValueError("attnres_mode must be 'none', 'full', or 'block'")
+        if self.attnres_block_size < 1:
+            raise ValueError("attnres_block_size must be positive")
+        if self.moe_latent_dim is not None and not (
+            1 <= self.moe_latent_dim <= self.d_model
+        ):
+            raise ValueError("moe_latent_dim must be in [1, d_model] or None")
+        if self.full_attn_period < 1:
+            raise ValueError("full_attn_period must be positive")
+        if self.max_seq_len < 1:
+            raise ValueError("max_seq_len must be positive")
 
     @property
     def cdtype(self) -> jnp.dtype:
@@ -145,16 +182,28 @@ class DecoderLayer(nnx.Module):
 
         # Pre-norm before the token mixer (Fig. 2). RMSNorm reused from the GDN-2 layer.
         self.norm1 = RMSNorm(cfg.d_model, eps=cfg.rms_eps, rngs=rngs)
+        self.token_residual = (
+            AttentionResidual(cfg.d_model, eps=cfg.rms_eps, rngs=rngs)
+            if cfg.attnres_mode != "none"
+            else None
+        )
 
         if self.is_full_attn:
-            # Full attention: NoPE Multi-head Latent Attention (absorbed/GQA form).
-            self.token_mixer = GroupedQueryLatentAttention(
+            # Full attention: NoPE gated MLA (absorbed/GQA form).
+            mla_cls = (
+                GatedMultiHeadLatentAttention
+                if cfg.mla_gated
+                else GroupedQueryLatentAttention
+            )
+            mla_kwargs = {} if cfg.mla_gated else {"gated": False}
+            self.token_mixer = mla_cls(
                 embed_dim=cfg.d_model,
                 num_q_heads=cfg.mla_num_q_heads,
                 num_kv_heads=cfg.mla_num_kv_heads,
                 head_dim=cfg.mla_head_dim,
                 compute_dtype=cfg.cdtype,
                 rngs=rngs,
+                **mla_kwargs,
             )
         else:
             # Linear attention: Gated DeltaNet-2 (the KDA substitute).
@@ -173,9 +222,19 @@ class DecoderLayer(nnx.Module):
 
         # Pre-norm before the channel mixer.
         self.norm2 = RMSNorm(cfg.d_model, eps=cfg.rms_eps, rngs=rngs)
+        self.channel_residual = (
+            AttentionResidual(cfg.d_model, eps=cfg.rms_eps, rngs=rngs)
+            if cfg.attnres_mode != "none"
+            else None
+        )
 
-        # Channel mixer: MoE
-        self.channel_mixer = GroupedGemmMoE(
+        # Channel mixer: LatentMoE by default; setting moe_latent_dim=None restores
+        # the original full-width routed experts for checkpoint compatibility.
+        moe_cls = LatentMoE if cfg.moe_latent_dim is not None else GroupedGemmMoE
+        moe_kwargs = (
+            {"latent_dim": cfg.moe_latent_dim} if cfg.moe_latent_dim is not None else {}
+        )
+        self.channel_mixer = moe_cls(
             d_model=cfg.d_model,
             d_ff=cfg.moe_d_ff,
             n_routed=cfg.moe_n_routed,
@@ -185,7 +244,16 @@ class DecoderLayer(nnx.Module):
             topk_groups=cfg.moe_topk_groups,
             compute_dtype=cfg.cdtype,
             rngs=rngs,
+            **moe_kwargs,
         )
+
+    def token_delta(self, h: jax.Array) -> jax.Array:
+        """Token-mixer sublayer output without applying a residual merge."""
+        return self.token_mixer(self.norm1(h))
+
+    def channel_delta(self, h: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
+        """LatentMoE sublayer output without applying a residual merge."""
+        return self.channel_mixer(self.norm2(h))
 
     def __call__(self, x: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
         """x: [B, L, d_model] -> (x, aux_or_None).
@@ -194,13 +262,10 @@ class DecoderLayer(nnx.Module):
         needs (aux loss + per-expert token counts for the router-bias update).
         """
         # --- token mixing (residual, pre-norm) ---
-        h = self.norm1(x)
-        h = self.token_mixer(h)
-        x = x + h
+        x = x + self.token_delta(x)
 
         # --- channel mixing (residual, pre-norm) ---
-        y = self.norm2(x)
-        m, aux = self.channel_mixer(y)
+        m, aux = self.channel_delta(x)
         x = x + m
         return x, aux
 
@@ -208,32 +273,33 @@ class DecoderLayer(nnx.Module):
         """Per-layer streaming cache: a GDN2Cache (linear layer) or MLACache (MLA)."""
         return self.token_mixer.init_cache(batch_size, max_len, dtype)
 
+    def stream_token_delta(
+        self, h: jax.Array, cache: GDN2Cache | MLACache
+    ) -> tuple[jax.Array, GDN2Cache | MLACache]:
+        """Streaming token-mixer delta without applying a residual merge."""
+        h = self.norm1(h)
+        if isinstance(cache, GDN2Cache) and isinstance(
+            self.token_mixer, GatedDeltaNet2
+        ):
+            return self.token_mixer.step(h, cache)
+        if isinstance(cache, MLACache) and isinstance(
+            self.token_mixer, GroupedQueryLatentAttention
+        ):
+            return self.token_mixer.step(h, cache)
+        raise ValueError(
+            f"Cache type {type(cache)} does not match token mixer {type(self.token_mixer)}"
+        )
+
     def step(
         self, x: jax.Array, cache: GDN2Cache | MLACache
     ) -> tuple[jax.Array, GDN2Cache | MLACache]:
         """Streaming forward for one block. x: [B, L, d_model] -> (x, new_cache).
         Only the token mixer is stateful; the channel mixer (MoE) is position-wise,
         so it needs no cache."""
-        h = self.norm1(x)
-
-        if isinstance(cache, GDN2Cache) and isinstance(
-            self.token_mixer, GatedDeltaNet2
-        ):
-            # GDN-2: fixed-size recurrent state (O(1) per token).
-            h, new_cache = self.token_mixer.step(h, cache)
-        elif isinstance(cache, MLACache) and isinstance(
-            self.token_mixer, GroupedQueryLatentAttention
-        ):
-            # MLA: growing latent cache (O(context) per token).
-            h, new_cache = self.token_mixer.step(h, cache)
-        else:
-            raise ValueError(
-                f"Cache type {type(cache)} does not match token mixer {type(self.token_mixer)}"
-            )
+        h, new_cache = self.stream_token_delta(x, cache)
 
         x = x + h
-        y = self.norm2(x)
-        m, _ = self.channel_mixer(y)
+        m, _ = self.channel_delta(x)
         x = x + m
         return x, new_cache
 
@@ -256,9 +322,16 @@ class KimiLinear(nnx.Module):
         self.layers = nnx.List(
             [DecoderLayer(cfg, i, rngs=rngs) for i in range(cfg.n_layers)]
         )
+        # The paper explicitly aggregates all completed depth sources before the
+        # output head. This query is distinct from every pre-sublayer query.
+        self.final_residual = (
+            AttentionResidual(cfg.d_model, eps=cfg.rms_eps, rngs=rngs)
+            if cfg.attnres_mode != "none"
+            else None
+        )
 
         # Final pre-head norm + untied LM head (Moonlight/DeepSeek do not tie weights;
-        # to tie, drop lm_head and use `x @ self.embed.embedding.value.T` instead).
+        # to tie, drop lm_head and use `x @ self.embed.embedding[...].T` instead).
         self.norm_f = RMSNorm(cfg.d_model, eps=cfg.rms_eps, rngs=rngs)
         self.lm_head = nnx.Linear(
             cfg.d_model,
@@ -285,11 +358,66 @@ class KimiLinear(nnx.Module):
         ] = []  # one [E] vector per MoE layer, in layer order
 
         x = self.embed(input_ids)  # [B, L, d_model]
-        for layer in self.layers:
-            x, aux = layer(x)
+        if self.cfg.attnres_mode == "none":
+            for layer in self.layers:
+                x, aux = layer(x)
+                aux_loss = aux_loss + aux["aux_loss"]
+                group_sizes.append(aux["group_sizes"])
+        elif self.cfg.attnres_mode == "full":
+            values = [x]
+            for layer in self.layers:
+                assert layer.token_residual is not None
+                assert layer.channel_residual is not None
 
-            aux_loss = aux_loss + aux["aux_loss"]
-            group_sizes.append(aux["group_sizes"])
+                h = layer.token_residual(values)
+                values.append(layer.token_delta(h))
+
+                h = layer.channel_residual(values)
+                delta, aux = layer.channel_delta(h)
+                values.append(delta)
+
+                aux_loss = aux_loss + aux["aux_loss"]
+                group_sizes.append(aux["group_sizes"])
+
+            assert self.final_residual is not None
+            x = self.final_residual(values)
+        else:
+            # Block AttnRes: completed blocks include the token embedding b_0.
+            # Sublayer deltas are summed inside the current block; only completed
+            # block summaries and the evolving partial sum are attended over.
+            completed = [x]
+            partial = None
+            sublayer_idx = 0
+
+            for layer in self.layers:
+                assert layer.token_residual is not None
+                assert layer.channel_residual is not None
+
+                sources = completed if partial is None else [*completed, partial]
+                h = layer.token_residual(sources)
+                delta = layer.token_delta(h)
+                partial = delta if partial is None else partial + delta
+                sublayer_idx += 1
+                if sublayer_idx % self.cfg.attnres_block_size == 0:
+                    completed.append(partial)
+                    partial = None
+
+                sources = completed if partial is None else [*completed, partial]
+                h = layer.channel_residual(sources)
+                delta, aux = layer.channel_delta(h)
+                partial = delta if partial is None else partial + delta
+                sublayer_idx += 1
+                if sublayer_idx % self.cfg.attnres_block_size == 0:
+                    completed.append(partial)
+                    partial = None
+
+                aux_loss = aux_loss + aux["aux_loss"]
+                group_sizes.append(aux["group_sizes"])
+
+            if partial is not None:
+                completed.append(partial)
+            assert self.final_residual is not None
+            x = self.final_residual(completed)
 
         x = self.norm_f(x)
         # Upcast logits to fp32 for a numerically stable softmax/cross-entropy under
@@ -316,10 +444,65 @@ class KimiLinear(nnx.Module):
         1 per decoded token). Returns (logits[B, L, vocab], new_caches)."""
         new_caches = []
 
+        if len(caches) != len(self.layers):
+            raise ValueError(
+                f"Expected {len(self.layers)} layer caches, got {len(caches)}"
+            )
+
         x = self.embed(input_ids)
-        for layer, cache in zip(self.layers, caches):
-            x, new_cache = layer.step(x, cache)
-            new_caches.append(new_cache)
+        if self.cfg.attnres_mode == "none":
+            for layer, cache in zip(self.layers, caches):
+                x, new_cache = layer.step(x, cache)
+                new_caches.append(new_cache)
+        elif self.cfg.attnres_mode == "full":
+            values = [x]
+            for layer, cache in zip(self.layers, caches):
+                assert layer.token_residual is not None
+                assert layer.channel_residual is not None
+
+                h = layer.token_residual(values)
+                h, new_cache = layer.stream_token_delta(h, cache)
+                new_caches.append(new_cache)
+                values.append(h)
+
+                h = layer.channel_residual(values)
+                delta, _ = layer.channel_delta(h)
+                values.append(delta)
+
+            assert self.final_residual is not None
+            x = self.final_residual(values)
+        else:
+            completed = [x]
+            partial = None
+            sublayer_idx = 0
+
+            for layer, cache in zip(self.layers, caches):
+                assert layer.token_residual is not None
+                assert layer.channel_residual is not None
+
+                sources = completed if partial is None else [*completed, partial]
+                h = layer.token_residual(sources)
+                delta, new_cache = layer.stream_token_delta(h, cache)
+                new_caches.append(new_cache)
+                partial = delta if partial is None else partial + delta
+                sublayer_idx += 1
+                if sublayer_idx % self.cfg.attnres_block_size == 0:
+                    completed.append(partial)
+                    partial = None
+
+                sources = completed if partial is None else [*completed, partial]
+                h = layer.channel_residual(sources)
+                delta, _ = layer.channel_delta(h)
+                partial = delta if partial is None else partial + delta
+                sublayer_idx += 1
+                if sublayer_idx % self.cfg.attnres_block_size == 0:
+                    completed.append(partial)
+                    partial = None
+
+            if partial is not None:
+                completed.append(partial)
+            assert self.final_residual is not None
+            x = self.final_residual(completed)
 
         x = self.norm_f(x)
         return self.lm_head(x).astype(jnp.float32), new_caches

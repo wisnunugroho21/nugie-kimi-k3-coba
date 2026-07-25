@@ -1,4 +1,4 @@
-"""NoPE Multi-head Latent Attention (MLA) — the FULL-attention token mixer.
+"""NoPE Gated Multi-head Latent Attention (MLA) — the full-attention mixer.
 
 In the Kimi Linear hybrid (Sec. 3 of the paper), 1 of every 4 layers is ordinary
 softmax attention; this module is that layer, in Kimi Linear's exact flavor:
@@ -12,6 +12,10 @@ softmax attention; this module is that layer, in Kimi Linear's exact flavor:
   * Written in the ABSORBED form (see the class docstring): with no RoPE in the
     way, the K/V up-projections fold into the neighboring matrices exactly, so the
     latent itself serves as both K and V and never gets up-projected at runtime.
+  * Gated attention: a query-token-dependent sigmoid gate modulates every head
+    channel after attention and before the output projection.  This is the Gated
+    MLA layout used by Instella and the head-specific gating placement identified
+    by "Gated Attention for Large Language Models."
 
 Two paths, same math: `__call__` for full-sequence training (causal-masked matrix
 attention) and `step` for streaming decode (append the new latent to a preallocated
@@ -43,7 +47,7 @@ class MLACache(NamedTuple):
 
 
 class GroupedQueryLatentAttention(nnx.Module):
-    """Grouped-Query attention over a low-rank KV *latent*, in MLA "absorbed" form.
+    """Grouped-query attention over a low-rank KV latent, with optional gating.
 
     This is NoPE (no rotary embeddings) Multi-head Latent Attention written in its
     matrix-absorbed form, fused with GQA-style KV-head sharing. Each of the three
@@ -72,6 +76,7 @@ class GroupedQueryLatentAttention(nnx.Module):
         head_dim: int,
         rngs: nnx.Rngs,
         compute_dtype: jnp.dtype = F32,
+        gated: bool = False,
     ):
         # Matmul dtype for the projections (bf16 on H200); the QK^T / softmax / AV
         # core is upcast to fp32 below regardless, for a stable attention distribution.
@@ -86,6 +91,7 @@ class GroupedQueryLatentAttention(nnx.Module):
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+        self.gated = gated
 
         # How many query heads share each KV/latent head (the GQA group size).
         self.group_size = num_q_heads // num_kv_heads
@@ -125,6 +131,29 @@ class GroupedQueryLatentAttention(nnx.Module):
             param_dtype=F32,
             rngs=rngs,
         )
+
+        # Head-specific, element-wise sigmoid gate.  It is computed from the
+        # current query token and therefore adds nothing to the KV cache.
+        self.gate_proj = (
+            nnx.Linear(
+                embed_dim,
+                d_q,
+                use_bias=False,
+                kernel_init=_XAVIER,
+                dtype=compute_dtype,
+                param_dtype=F32,
+                rngs=rngs,
+            )
+            if gated
+            else None
+        )
+
+    def _output(self, weighted_latents: jax.Array, x: jax.Array) -> jax.Array:
+        """Apply the optional per-head gate before the absorbed output projection."""
+        if self.gate_proj is not None:
+            gate = jax.nn.sigmoid(self.gate_proj(x).astype(F32))
+            weighted_latents = weighted_latents.astype(F32) * gate
+        return self.w_uv_o(weighted_latents.astype(self.compute_dtype))
 
     def __call__(self, x: jax.Array) -> jax.Array:
         # x: (B, T, embed_dim)
@@ -194,7 +223,7 @@ class GroupedQueryLatentAttention(nnx.Module):
         )
 
         # Absorbed W_UV . W_O: up-project the value latent and output-project.
-        output = self.w_uv_o(weighted_latents)  # (B, T, embed_dim)
+        output = self._output(weighted_latents, x)  # (B, T, embed_dim)
 
         return output
 
@@ -260,5 +289,13 @@ class GroupedQueryLatentAttention(nnx.Module):
             B, L, self.num_q_heads * self.head_dim
         )
 
-        output = self.w_uv_o(weighted)  # (B, L, embed_dim)
+        output = self._output(weighted, x)  # (B, L, embed_dim)
         return output, MLACache(l_kv, new_pos)
+
+
+class GatedMultiHeadLatentAttention(GroupedQueryLatentAttention):
+    """Explicit public name for MLA with the head-specific output gate enabled."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs["gated"] = True
+        super().__init__(*args, **kwargs)

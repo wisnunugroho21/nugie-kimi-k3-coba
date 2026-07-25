@@ -1,22 +1,21 @@
 """
-Dispatched grouped-GEMM MoE channel mixer for Kimi Linear (JAX / Flax NNX).
+Dispatched grouped-GEMM LatentMoE channel mixer for Kimi Linear.
 
-Replaces the dense O(E) reference MoE in kimi_linear_gdn2.py with the production
-pattern: permute tokens so each expert's assignments are contiguous (dispatch),
-run one matmul per expert as a single grouped GEMM (`jax.lax.ragged_dot`), then
-un-permute and weighted-sum (combine). No token dropping, no capacity padding.
+The routed path follows LatentMoE: a shared down-projection compresses tokens
+before dispatch, the routed experts operate in that latent space, and a shared
+up-projection restores model width after combine. The router and always-on shared
+experts deliberately remain at full model width.
 
 Pipeline per forward:
     1. Route:    sigmoid affinities (+ aux-loss-free bias on the SELECTION only)
                  -> keep only the token's top expert GROUPS (group-limited routing)
                  -> top-k experts among them -> normalize the k gate weights.
-    2. Dispatch: build (token, expert) assignments, sort by expert id, gather the
-                 hidden states into expert-contiguous order; group_sizes = per-expert
-                 counts.
-    3. Grouped GEMM: ragged_dot(x_sorted, W_in, group_sizes) -> SwiGLU ->
+    2. Compress: W_down maps routed tokens from d_model to latent_dim.
+    3. Dispatch: gather latent states into expert-contiguous order.
+    4. Grouped GEMM: ragged_dot(x_sorted, W_in, group_sizes) -> SwiGLU ->
                  ragged_dot(a, W_out, group_sizes).   (gate+up fused into W_in)
-    4. Combine:  scale rows by gate weight, scatter-add back to tokens (sums the
-                 top-k contributions), add the always-on shared expert.
+    5. Combine: scatter-add in latent space, W_up back to d_model, then add the
+                always-on full-width shared expert.
 
 Routing follows the DeepSeek-V3 / Moonlight / Kimi lineage: sigmoid scoring,
 normalized top-k weights, a shared expert, aux-loss-free load balancing via a
@@ -41,11 +40,12 @@ _XAVIER = nnx.initializers.variance_scaling(2**-5, "fan_avg", "uniform")
 
 
 class GroupedGemmMoE(nnx.Module):
-    """Token-dispatched grouped-GEMM MoE with a shared expert.
+    """Token-dispatched grouped-GEMM MoE with optional latent routed experts.
 
     Args:
         d_model:   model width.
         d_ff:      per-expert hidden width (SwiGLU inner dim).
+        latent_dim: routed-expert width. ``None`` retains the legacy full-width MoE.
         n_routed:  number of routed experts E.
         n_shared:  number of shared experts (always-on), folded into one SwiGLU.
         top_k:     experts activated per token.
@@ -65,6 +65,7 @@ class GroupedGemmMoE(nnx.Module):
         n_shared: int = 1,
         top_k: int = 8,
         *,
+        latent_dim: int | None = None,
         n_groups: int = 1,
         topk_groups: int = 1,
         norm_topk: bool = True,
@@ -79,8 +80,14 @@ class GroupedGemmMoE(nnx.Module):
         assert top_k <= topk_groups * (n_routed // n_groups), (
             "top_k experts must fit inside the topk_groups selected groups"
         )
+        if latent_dim is not None and not 1 <= latent_dim <= d_model:
+            raise ValueError(
+                f"latent_dim must be in [1, d_model={d_model}], got {latent_dim}"
+            )
         self.d_model = d_model
         self.d_ff = d_ff
+        self.latent_dim = latent_dim
+        self.expert_dim = latent_dim or d_model
         self.E = n_routed
         self.top_k = top_k
         self.n_groups = n_groups
@@ -99,14 +106,45 @@ class GroupedGemmMoE(nnx.Module):
         )
         self.router_bias = nnx.Variable(jnp.zeros((n_routed,), F32))
 
+        # LatentMoE Eq. (1)/(2): only routed experts are compressed. Routing and
+        # the shared experts continue to consume the original full-width tokens.
+        self.latent_down = (
+            nnx.Linear(
+                d_model,
+                self.expert_dim,
+                use_bias=False,
+                kernel_init=_XAVIER,
+                dtype=compute_dtype,
+                param_dtype=F32,
+                rngs=rngs,
+            )
+            if latent_dim is not None
+            else None
+        )
+        self.latent_up = (
+            nnx.Linear(
+                self.expert_dim,
+                d_model,
+                use_bias=False,
+                kernel_init=_XAVIER,
+                dtype=compute_dtype,
+                param_dtype=F32,
+                rngs=rngs,
+            )
+            if latent_dim is not None
+            else None
+        )
+
         # Stacked routed-expert weights. Gate and up are fused into W_in so the
         # forward needs only TWO grouped GEMMs (W_in, W_out) instead of three.
         kin, kout = jax.random.split(rngs.params(), 2)
         self.w_in = nnx.Param(
-            jax.random.normal(kin, (n_routed, d_model, 2 * d_ff), F32) * (d_model**-0.5)
+            jax.random.normal(kin, (n_routed, self.expert_dim, 2 * d_ff), F32)
+            * (self.expert_dim**-0.5)
         )
         self.w_out = nnx.Param(
-            jax.random.normal(kout, (n_routed, d_ff, d_model), F32) * (d_ff**-0.5)
+            jax.random.normal(kout, (n_routed, d_ff, self.expert_dim), F32)
+            * (d_ff**-0.5)
         )
 
         # Shared expert(s) as a single wider SwiGLU (always applied to every token).
@@ -189,6 +227,11 @@ class GroupedGemmMoE(nnx.Module):
         cdtype = self.compute_dtype  # force bf16 GEMMs even though the residual is fp32
 
         top_idx, gate, router_logits = self._route(xf)
+        zf = (
+            self.latent_down(xf).astype(cdtype)
+            if self.latent_down is not None
+            else xf.astype(cdtype)
+        )
 
         # ---- dispatch: flatten assignments and sort by expert id ----
         flat_e = top_idx.reshape(T * k).astype(jnp.int32)  # expert per assignment
@@ -200,7 +243,7 @@ class GroupedGemmMoE(nnx.Module):
         sort_w = flat_w[order]
         group_sizes = jnp.bincount(flat_e, length=self.E)  # [E], sums to T*k
 
-        x_sorted = xf[sort_tok].astype(cdtype)  # [M, d], M = T*k
+        x_sorted = zf[sort_tok]  # [M, latent_dim], M = T*k
 
         # ---- grouped GEMM: one matmul per expert over its contiguous rows ----
         h = jax.lax.ragged_dot(x_sorted, self.w_in.astype(cdtype), group_sizes)
@@ -212,9 +255,14 @@ class GroupedGemmMoE(nnx.Module):
 
         # ---- combine: weight, un-permute, sum top-k per token ----
         y_sorted = y_sorted.astype(F32) * sort_w[:, None]
+        routed_latent = jnp.zeros((T, self.expert_dim), F32).at[sort_tok].add(
+            y_sorted
+        )
         routed = (
-            jnp.zeros((T, d), F32).at[sort_tok].add(y_sorted)
-        )  # scatter-add over slots
+            self.latent_up(routed_latent.astype(cdtype)).astype(F32)
+            if self.latent_up is not None
+            else routed_latent
+        )
 
         out = routed + self._shared(xf).astype(F32)
         out = out.reshape(B, L, d).astype(cdtype)
@@ -240,17 +288,30 @@ class GroupedGemmMoE(nnx.Module):
         T = B * L
         xf = x.reshape(T, d)
         top_idx, gate, _ = self._route(xf)
+        zf = self.latent_down(xf) if self.latent_down is not None else xf
 
         full = (
             jnp.zeros((T, self.E), F32).at[jnp.arange(T)[:, None], top_idx].add(gate)
         )  # [T,E] sparse weights
-        h = jnp.einsum("td,edf->tef", xf, self.w_in)  # [T,E,2*d_ff]
+        h = jnp.einsum("td,edf->tef", zf, self.w_in)  # [T,E,2*d_ff]
         g_, u_ = jnp.split(h, 2, axis=-1)
         a = jax.nn.silu(g_) * u_
         ye = jnp.einsum("tef,efd->ted", a, self.w_out)  # [T,E,d]
-        routed = jnp.einsum("te,ted->td", full, ye)
+        routed_latent = jnp.einsum("te,ted->td", full, ye)
+        routed = (
+            self.latent_up(routed_latent)
+            if self.latent_up is not None
+            else routed_latent
+        )
         out = routed + self._shared(xf)
         return out.reshape(B, L, d)
+
+
+class LatentMoE(GroupedGemmMoE):
+    """Paper-named MoE variant whose routed experts require a latent width."""
+
+    def __init__(self, *args, latent_dim: int, **kwargs):
+        super().__init__(*args, latent_dim=latent_dim, **kwargs)
 
 
 # --------------------------------------------------------------------------- #
