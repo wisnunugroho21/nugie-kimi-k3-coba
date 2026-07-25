@@ -111,6 +111,10 @@ class KimiLinearConfig:
     mla_num_q_heads: int = 8  # query heads
     mla_num_kv_heads: int = 2  # KV/latent heads (GQA); q_heads must be a multiple
     mla_head_dim: int = 64  # per-head latent (rank) width
+    # Training bounds score activations to [B,Hkv,G,chunk,T]. Decode scans the
+    # compressed cache a page at a time with online softmax and skips empty pages.
+    mla_query_chunk_size: int = 128
+    mla_cache_page_size: int = 64
     # Declared context cap: checked against the training seq_len and used as the
     # default size of the preallocated MLA latent cache in init_cache/generate.
     # (The MLA causal mask itself is built on the fly from the actual length.)
@@ -170,6 +174,8 @@ class KimiLinearConfig:
             "mla_num_q_heads": self.mla_num_q_heads,
             "mla_num_kv_heads": self.mla_num_kv_heads,
             "mla_head_dim": self.mla_head_dim,
+            "mla_query_chunk_size": self.mla_query_chunk_size,
+            "mla_cache_page_size": self.mla_cache_page_size,
             "max_seq_len": self.max_seq_len,
             "moe_d_ff": self.moe_d_ff,
             "moe_n_routed": self.moe_n_routed,
@@ -360,6 +366,8 @@ class DecoderLayer(nnx.Module):
                 num_q_heads=cfg.mla_num_q_heads,
                 num_kv_heads=cfg.mla_num_kv_heads,
                 head_dim=cfg.mla_head_dim,
+                query_chunk_size=cfg.mla_query_chunk_size,
+                cache_page_size=cfg.mla_cache_page_size,
                 compute_dtype=cfg.cdtype,
                 rngs=rngs,
                 **mla_kwargs,

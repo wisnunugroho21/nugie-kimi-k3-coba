@@ -77,15 +77,25 @@ class GroupedQueryLatentAttention(nnx.Module):
         rngs: nnx.Rngs,
         compute_dtype: jnp.dtype = F32,
         gated: bool = False,
+        query_chunk_size: int = 128,
+        cache_page_size: int = 64,
     ):
         # Matmul dtype for the projections (bf16 on H200); the QK^T / softmax / AV
         # core is upcast to fp32 below regardless, for a stable attention distribution.
         self.compute_dtype = compute_dtype
         # GQA constraint: every KV (latent) head must serve a whole number of
-        # query heads, so that `repeat` below tiles the latent evenly.
-        if embed_dim < 1 or num_q_heads < 1 or num_kv_heads < 1 or head_dim < 1:
+        # query heads.
+        if (
+            embed_dim < 1
+            or num_q_heads < 1
+            or num_kv_heads < 1
+            or head_dim < 1
+            or query_chunk_size < 1
+            or cache_page_size < 1
+        ):
             raise ValueError(
-                "embed_dim, num_q_heads, num_kv_heads, and head_dim must be positive"
+                "embed_dim, num_q_heads, num_kv_heads, head_dim, "
+                "query_chunk_size, and cache_page_size must be positive"
             )
         if num_q_heads % num_kv_heads != 0:
             raise ValueError(
@@ -96,6 +106,8 @@ class GroupedQueryLatentAttention(nnx.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.gated = gated
+        self.query_chunk_size = query_chunk_size
+        self.cache_page_size = cache_page_size
 
         # How many query heads share each KV/latent head (the GQA group size).
         self.group_size = num_q_heads // num_kv_heads
@@ -159,6 +171,61 @@ class GroupedQueryLatentAttention(nnx.Module):
             weighted_latents = weighted_latents.astype(F32) * gate
         return self.w_uv_o(weighted_latents.astype(self.compute_dtype))
 
+    def _group_queries(self, q_latent: jax.Array) -> jax.Array:
+        """View query heads as [KV head, sharing group] without repeating KV."""
+        batch_size, seq_length, _ = q_latent.shape
+        return q_latent.reshape(
+            batch_size,
+            seq_length,
+            self.num_kv_heads,
+            self.group_size,
+            self.head_dim,
+        ).transpose(0, 2, 3, 1, 4)
+
+    def _group_latents(self, l_kv: jax.Array) -> jax.Array:
+        """Split the compressed latent into KV heads: [B, Hkv, T, Dh]."""
+        batch_size, seq_length, _ = l_kv.shape
+        return l_kv.reshape(
+            batch_size, seq_length, self.num_kv_heads, self.head_dim
+        ).transpose(0, 2, 1, 3)
+
+    def _flatten_grouped(self, weighted: jax.Array) -> jax.Array:
+        """Restore [B, T, Hq*Dh] from [B, Hkv, group, T, Dh]."""
+        batch_size, _, _, seq_length, _ = weighted.shape
+        return weighted.transpose(0, 3, 1, 2, 4).reshape(
+            batch_size, seq_length, self.num_q_heads * self.head_dim
+        )
+
+    def _attend_query_chunk(
+        self,
+        q: jax.Array,
+        l_kv: jax.Array,
+        mask: jax.Array,
+    ) -> jax.Array:
+        """Grouped attention for one query chunk, with a fully safe softmax.
+
+        q: [B, Hkv, group, Q, Dh], l_kv: [B, Hkv, K, Dh],
+        mask: [B, Q, K]. The grouped layout broadcasts each KV head to its
+        query-head group without allocating a repeated KV tensor.
+        """
+        logits = (
+            jnp.einsum("bhgqd,bhkd->bhgqk", q, l_kv).astype(F32)
+            / jnp.sqrt(self.head_dim)
+        )
+        expanded_mask = mask[:, None, None, :, :]
+        masked_logits = jnp.where(expanded_mask, logits, -jnp.inf)
+        has_keys = jnp.any(expanded_mask, axis=-1)
+        row_max = jnp.max(masked_logits, axis=-1)
+        safe_max = jnp.where(has_keys, row_max, 0.0)
+        weights = jnp.where(
+            expanded_mask,
+            jnp.exp(logits - safe_max[..., None]),
+            0.0,
+        )
+        denominator = jnp.maximum(jnp.sum(weights, axis=-1), 1.0)
+        probabilities = (weights / denominator[..., None]).astype(l_kv.dtype)
+        return jnp.einsum("bhgqk,bhkd->bhgqd", probabilities, l_kv)
+
     def __call__(
         self,
         x: jax.Array,
@@ -195,52 +262,10 @@ class GroupedQueryLatentAttention(nnx.Module):
                 raise TypeError("segment_ids must use an integer dtype")
         x = jnp.where(valid[..., None], x, 0)
 
-        # --- Queries (already in the compressed K space via the absorbed W_UK) ---
-        q_latent = self.w_q_uk(x)  # (B, T, num_q_heads * head_dim)
+        q_heads = self._group_queries(self.w_q_uk(x))
+        l_kv_heads = self._group_latents(self.w_dkv(x))
 
-        # Split the flat projection into per-head latent vectors.
-        q_reshaped = q_latent.reshape(
-            batch_size, seq_length, self.num_q_heads, self.head_dim
-        )  # (B, T, Hq, Dh)
-
-        # Move the head axis next to batch for batched matmuls: (B, Hq, T, Dh)
-        q_heads = q_reshaped.swapaxes(1, 2)
-
-        # --- Shared KV latent (serves as both keys and values) ---
-        l_kv = self.w_dkv(x)  # (B, T, num_kv_heads * head_dim)
-
-        l_kv_reshaped = l_kv.reshape(
-            batch_size, seq_length, self.num_kv_heads, self.head_dim
-        )  # (B, T, Hkv, Dh)
-
-        l_kv_heads = l_kv_reshaped.swapaxes(1, 2)  # (B, Hkv, T, Dh)
-
-        # GQA tiling: repeat each latent head `group_size` times so it lines up
-        # with the query heads. `repeat` interleaves, so KV head i feeds query
-        # heads [i*group_size : (i+1)*group_size]. Result: (B, Hq, T, Dh).
-        # (This materializes the full Hq KV stack; broadcasting would save memory
-        # but materializing keeps the einsums simple.)
-        l_kv_repeated = l_kv_heads.repeat(self.group_size, axis=1)
-
-        # --- Attention scores: Q . K^T, contracting the latent feature dim `d` ---
-        # 'd' is shared (contracted); 'k' indexes key/latent positions (kept).
-        qk_t = jnp.einsum("bhqd, bhkd -> bhqk", q_heads, l_kv_repeated)  # (B, Hq, T, T)
-
-        # Scale by sqrt of the latent per-head dim. Upcast to fp32 so the masking,
-        # softmax max/exp/sum are stable even when the projections ran in bf16.
-        scaled_logits = qk_t.astype(F32) / jnp.sqrt(self.head_dim)
-
-        # Causal mask (True = keep): future positions -> -inf so they vanish under
-        # softmax. Built at trace time from the actual sequence length — under jit
-        # this is a compile-time constant (folded by XLA), so nothing is stored in
-        # the module state or in checkpoints. Safe to use -inf because the diagonal
-        # is always kept (no fully-masked rows -> the softmax cannot NaN).
-        causal_mask = jnp.tril(jnp.ones((seq_length, seq_length), dtype=bool))
-        mask = (
-            causal_mask[None, :, :]
-            & valid[:, :, None]
-            & valid[:, None, :]
-        )
+        key_positions = jnp.arange(seq_length)
         if segment_ids is not None:
             previous_valid = jnp.pad(valid[:, :-1], ((0, 0), (1, 0)))
             previous_segment = jnp.pad(
@@ -252,35 +277,87 @@ class GroupedQueryLatentAttention(nnx.Module):
             # Canonicalize IDs into contiguous runs. This prevents a reused raw
             # ID after a boundary from reconnecting to an earlier segment.
             segment_run = jnp.cumsum(segment_start, axis=1)
-            same_segment = (
-                segment_run[:, :, None] == segment_run[:, None, :]
+        else:
+            segment_run = None
+
+        def attend_chunk(
+            query_chunk: jax.Array,
+            query_valid: jax.Array,
+            query_positions: jax.Array,
+            query_segments: jax.Array | None,
+        ) -> jax.Array:
+            mask = (
+                (key_positions[None, :] <= query_positions[:, None])[None, :, :]
+                & query_valid[:, :, None]
+                & valid[:, None, :]
             )
-            mask = mask & same_segment
-        # A masked query may otherwise have no valid keys (for example left
-        # padding). Retaining its diagonal yields a finite, disposable softmax row.
-        diagonal = jnp.eye(seq_length, dtype=bool)[None, :, :]
-        mask = mask | ((~valid)[:, :, None] & diagonal)
-        scaled_logits = jnp.where(mask[:, None], scaled_logits, -jnp.inf)
+            if query_segments is not None:
+                mask = mask & (
+                    query_segments[:, :, None] == segment_run[:, None, :]
+                )
+            return self._attend_query_chunk(query_chunk, l_kv_heads, mask)
 
-        # Softmax over the key axis -> per-query attention distribution (fp32), then
-        # back to the compute dtype for the (bf16) weighted-sum matmul below.
-        a = jax.nn.softmax(scaled_logits, axis=-1).astype(
-            l_kv_repeated.dtype
-        )  # (B, Hq, T, T)
+        chunk_size = min(self.query_chunk_size, seq_length)
+        if seq_length <= chunk_size:
+            weighted_heads = attend_chunk(
+                q_heads, valid, key_positions, segment_run
+            )
+        else:
+            num_chunks = (seq_length + chunk_size - 1) // chunk_size
+            padded_length = num_chunks * chunk_size
+            pad_length = padded_length - seq_length
+            padded_q = jnp.pad(
+                q_heads, ((0, 0), (0, 0), (0, 0), (0, pad_length), (0, 0))
+            )
+            padded_valid = jnp.pad(valid, ((0, 0), (0, pad_length)))
+            padded_segments = (
+                None
+                if segment_run is None
+                else jnp.pad(segment_run, ((0, 0), (0, pad_length)))
+            )
 
-        # --- Weighted sum of value-latents ---
-        # 'k' is shared between the weights and the value positions, so it is the
-        # contracted axis (the actual attention sum); 'd' is the kept feature dim.
-        # Because keys and values are the same latent, l_kv_repeated reappears here.
-        weighted_heads = jnp.einsum(
-            "bhqk, bhkd -> bhqd", a, l_kv_repeated
-        )  # (B, Hq, T, Dh)
+            def compute_chunk(chunk_index: jax.Array) -> jax.Array:
+                start = chunk_index * chunk_size
+                query_chunk = jax.lax.dynamic_slice_in_dim(
+                    padded_q, start, chunk_size, axis=3
+                )
+                query_valid = jax.lax.dynamic_slice_in_dim(
+                    padded_valid, start, chunk_size, axis=1
+                )
+                query_segments = (
+                    None
+                    if padded_segments is None
+                    else jax.lax.dynamic_slice_in_dim(
+                        padded_segments, start, chunk_size, axis=1
+                    )
+                )
+                return attend_chunk(
+                    query_chunk,
+                    query_valid,
+                    start + jnp.arange(chunk_size),
+                    query_segments,
+                )
 
-        # Move head axis back and flatten heads: (B, T, Hq, Dh) -> (B, T, Hq*Dh)
-        weighted_reshaped = weighted_heads.swapaxes(1, 2)
-        weighted_latents = weighted_reshaped.reshape(
-            batch_size, seq_length, self.num_q_heads * self.head_dim
-        )
+            # Rematerializing a chunk in backward keeps saved activation memory
+            # proportional to one Q chunk rather than the full T-by-T score matrix.
+            rematerialized_chunk = jax.checkpoint(compute_chunk)
+
+            def scan_chunk(_, chunk_index):
+                return None, rematerialized_chunk(chunk_index)
+
+            _, chunks = jax.lax.scan(
+                scan_chunk, None, jnp.arange(num_chunks, dtype=jnp.int32)
+            )
+            # [N, B, Hkv, G, C, Dh] -> [B, Hkv, G, N*C, Dh]
+            weighted_heads = chunks.transpose(1, 2, 3, 0, 4, 5).reshape(
+                batch_size,
+                self.num_kv_heads,
+                self.group_size,
+                padded_length,
+                self.head_dim,
+            )[:, :, :, :seq_length, :]
+
+        weighted_latents = self._flatten_grouped(weighted_heads)
 
         # Absorbed W_UV . W_O: up-project the value latent and output-project.
         output = self._output(weighted_latents, x)  # (B, T, embed_dim)
@@ -332,10 +409,8 @@ class GroupedQueryLatentAttention(nnx.Module):
                     f"[{pos}, {pos + L})"
                 )
 
-        # Queries for the new positions (already in the compressed K space via W_UK).
-        q_heads = (
-            self.w_q_uk(x).reshape(B, L, self.num_q_heads, self.head_dim).swapaxes(1, 2)
-        )  # (B, Hq, L, Dh)
+        # Queries for the new positions, grouped without repeating KV heads.
+        q_heads = self._group_queries(self.w_q_uk(x))  # (B, Hkv, G, L, Dh)
 
         # New latents -> write them into the cache buffer at the current position.
         l_new = self.w_dkv(x)  # (B, L, Hkv*Dh)
@@ -344,32 +419,99 @@ class GroupedQueryLatentAttention(nnx.Module):
         )
 
         # --- Shared KV latent (serves as both keys and values) ---
-        l_kv_heads = l_kv.reshape(
-            B, max_len, self.num_kv_heads, self.head_dim
-        ).swapaxes(1, 2)  # (B, Hkv, max_len, Dh)
-        l_kv_rep = l_kv_heads.repeat(self.group_size, axis=1)  # (B, Hq, max_len, Dh)
+        l_kv_heads = self._group_latents(l_kv)
 
-        # Scores: the L new queries attend over all max_len cached slots.
-        logits = jnp.einsum("bhqd, bhkd -> bhqk", q_heads, l_kv_rep).astype(
-            F32
-        ) / jnp.sqrt(self.head_dim)
-
-        # Causal mask offset by the cache position: query i sits at absolute position
-        # pos+i and may attend to slot j iff j <= pos+i.  This also masks the not-yet-
-        # filled slots (j >= pos+L > pos+i), so no separate validity mask is needed.
-        q_pos = cache.pos + jnp.arange(L)  # (L,)
-        k_pos = jnp.arange(max_len)  # (max_len,)
-        mask = k_pos[None, :] <= q_pos[:, None]  # (L, max_len)
-        logits = jnp.where(mask[None, None], logits, -jnp.inf)
-
-        # Softmax over the key axis -> per-query attention distribution.
-        a = jax.nn.softmax(logits, axis=-1).astype(l_kv_rep.dtype)
-
-        # Weighted sum of value-latents: the same latent serves as both K and V.
-        weighted = jnp.einsum("bhqk, bhkd -> bhqd", a, l_kv_rep)  # (B, Hq, L, Dh)
-        weighted = weighted.swapaxes(1, 2).reshape(
-            B, L, self.num_q_heads * self.head_dim
+        # Page-wise online softmax never allocates scores over the full cache.
+        # Empty pages bypass their dot products, so early decode scales with the
+        # filled prefix rather than the declared maximum cache capacity.
+        page_size = min(self.cache_page_size, max_len)
+        num_pages = (max_len + page_size - 1) // page_size
+        q_pos = cache.pos + jnp.arange(L)
+        numerator = jnp.zeros(
+            (B, self.num_kv_heads, self.group_size, L, self.head_dim), F32
         )
+        denominator = jnp.zeros(
+            (B, self.num_kv_heads, self.group_size, L), F32
+        )
+        running_max = jnp.full_like(denominator, -jnp.inf)
+
+        def page_body(page_index, state):
+            current_max, current_denominator, current_numerator = state
+            page_start = page_index * page_size
+
+            def attend_page(state):
+                current_max, current_denominator, current_numerator = state
+                # dynamic_slice clamps at the end. The page_start lower bound in
+                # page_mask excludes any overlap introduced for a short final page.
+                slice_start = jnp.minimum(page_start, max_len - page_size)
+                page = jax.lax.dynamic_slice_in_dim(
+                    l_kv_heads, slice_start, page_size, axis=2
+                )
+                key_positions = slice_start + jnp.arange(page_size)
+                page_end = jnp.minimum(page_start + page_size, new_pos)
+                page_mask = (
+                    (key_positions[None, :] >= page_start)
+                    & (key_positions[None, :] < page_end)
+                    & (key_positions[None, :] <= q_pos[:, None])
+                )
+                logits = (
+                    jnp.einsum("bhgqd,bhkd->bhgqk", q_heads, page).astype(F32)
+                    / jnp.sqrt(self.head_dim)
+                )
+                expanded_mask = page_mask[None, None, None, :, :]
+                masked_logits = jnp.where(expanded_mask, logits, -jnp.inf)
+                has_page = jnp.any(expanded_mask, axis=-1)
+                page_max = jnp.max(masked_logits, axis=-1)
+                safe_page_max = jnp.where(has_page, page_max, 0.0)
+                page_weights = jnp.where(
+                    expanded_mask,
+                    jnp.exp(logits - safe_page_max[..., None]),
+                    0.0,
+                )
+                page_denominator = jnp.sum(page_weights, axis=-1)
+                page_numerator = jnp.einsum(
+                    "bhgqk,bhkd->bhgqd", page_weights, page.astype(F32)
+                )
+
+                has_current = current_denominator > 0
+                merged_max = jnp.where(
+                    has_page,
+                    jnp.where(
+                        has_current,
+                        jnp.maximum(current_max, page_max),
+                        page_max,
+                    ),
+                    current_max,
+                )
+                merged_max = jax.lax.stop_gradient(merged_max)
+                current_scale = jnp.where(
+                    has_current, jnp.exp(current_max - merged_max), 0.0
+                )
+                page_scale = jnp.where(
+                    has_page, jnp.exp(page_max - merged_max), 0.0
+                )
+                merged_denominator = (
+                    current_scale * current_denominator
+                    + page_scale * page_denominator
+                )
+                merged_numerator = (
+                    current_scale[..., None] * current_numerator
+                    + page_scale[..., None] * page_numerator
+                )
+                return merged_max, merged_denominator, merged_numerator
+
+            return jax.lax.cond(
+                page_start < new_pos, attend_page, lambda value: value, state
+            )
+
+        _, denominator, numerator = jax.lax.fori_loop(
+            0,
+            num_pages,
+            page_body,
+            (running_max, denominator, numerator),
+        )
+        weighted = numerator / jnp.maximum(denominator[..., None], 1.0)
+        weighted = self._flatten_grouped(weighted.astype(l_kv.dtype))
 
         output = self._output(weighted, x)  # (B, L, embed_dim)
         return output, MLACache(l_kv, new_pos)

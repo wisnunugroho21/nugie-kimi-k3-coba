@@ -263,6 +263,103 @@ def test_gated_mla_full_and_cached_prefill_match():
     assert int(cache.pos) == 5
 
 
+def _repeated_kv_mla_reference(mla, x, attention_mask, segment_ids):
+    """Pre-optimization MLA math with explicitly repeated KV heads."""
+    valid = attention_mask.astype(bool)
+    masked_x = jnp.where(valid[..., None], x, 0)
+    batch_size, seq_length, _ = x.shape
+    q = mla.w_q_uk(masked_x).reshape(
+        batch_size, seq_length, mla.num_q_heads, mla.head_dim
+    ).transpose(0, 2, 1, 3)
+    kv = mla.w_dkv(masked_x).reshape(
+        batch_size, seq_length, mla.num_kv_heads, mla.head_dim
+    ).transpose(0, 2, 1, 3)
+    repeated_kv = kv.repeat(mla.group_size, axis=1)
+    logits = (
+        jnp.einsum("bhqd,bhkd->bhqk", q, repeated_kv).astype(jnp.float32)
+        / jnp.sqrt(mla.head_dim)
+    )
+    mask = (
+        jnp.tril(jnp.ones((seq_length, seq_length), dtype=bool))[None]
+        & valid[:, :, None]
+        & valid[:, None, :]
+    )
+    previous_valid = jnp.pad(valid[:, :-1], ((0, 0), (1, 0)))
+    previous_segment = jnp.pad(segment_ids[:, :-1], ((0, 0), (1, 0)))
+    segment_start = valid & (
+        (~previous_valid) | (segment_ids != previous_segment)
+    )
+    segment_run = jnp.cumsum(segment_start, axis=1)
+    mask &= segment_run[:, :, None] == segment_run[:, None, :]
+    diagonal = jnp.eye(seq_length, dtype=bool)[None]
+    mask |= (~valid)[:, :, None] & diagonal
+    probabilities = jax.nn.softmax(
+        jnp.where(mask[:, None], logits, -jnp.inf), axis=-1
+    ).astype(repeated_kv.dtype)
+    weighted = jnp.einsum(
+        "bhqk,bhkd->bhqd", probabilities, repeated_kv
+    ).transpose(0, 2, 1, 3).reshape(
+        batch_size, seq_length, mla.num_q_heads * mla.head_dim
+    )
+    output = mla._output(weighted, masked_x)
+    return jnp.where(valid[..., None], output, 0)
+
+
+def test_mla_chunked_grouped_attention_matches_repeated_kv_reference():
+    mla = GroupedQueryLatentAttention(
+        embed_dim=12,
+        num_q_heads=4,
+        num_kv_heads=2,
+        head_dim=3,
+        query_chunk_size=2,
+        rngs=nnx.Rngs(101),
+    )
+    x = jax.random.normal(jax.random.key(102), (2, 5, 12))
+    attention_mask = jnp.array(
+        [[1, 1, 1, 1, 1], [0, 1, 1, 1, 0]], dtype=bool
+    )
+    # Reusing raw ID 1 after a boundary deliberately exercises contiguous-run
+    # canonicalization in addition to query chunk boundaries.
+    segment_ids = jnp.array([[1, 1, 2, 2, 1], [9, 1, 1, 2, 2]], jnp.int32)
+
+    actual = mla(x, attention_mask, segment_ids)
+    expected = _repeated_kv_mla_reference(
+        mla, x, attention_mask, segment_ids
+    )
+
+    assert jnp.allclose(actual, expected, rtol=1e-5, atol=1e-5)
+    gradient = jax.grad(
+        lambda inputs: jnp.sum(mla(inputs, attention_mask, segment_ids))
+    )(x)
+    assert jnp.all(jnp.isfinite(gradient))
+    assert jnp.all(gradient[~attention_mask] == 0)
+
+
+def test_mla_paged_decode_matches_full_attention_across_partial_pages():
+    mla = GatedMultiHeadLatentAttention(
+        embed_dim=12,
+        num_q_heads=4,
+        num_kv_heads=2,
+        head_dim=3,
+        query_chunk_size=3,
+        cache_page_size=2,
+        rngs=nnx.Rngs(103),
+    )
+    x = jax.random.normal(jax.random.key(104), (1, 7, 12))
+    full = mla(x)
+    cache = mla.init_cache(batch_size=1, max_len=9)
+
+    outputs = []
+    for start, stop in ((0, 3), (3, 5), (5, 6), (6, 7)):
+        output, cache = mla.step(x[:, start:stop], cache)
+        outputs.append(output)
+
+    streamed = jnp.concatenate(outputs, axis=1)
+    assert jnp.allclose(full, streamed, rtol=1e-5, atol=1e-5)
+    assert int(cache.pos) == 7
+    assert cache.l_kv.shape == (1, 9, 6)
+
+
 def test_gated_mla_bfloat_cache_uses_compute_dtype_and_stays_equivalent():
     mla = GatedMultiHeadLatentAttention(
         embed_dim=12,
@@ -368,6 +465,8 @@ def test_nonzero_block_attnres_matches_token_by_token_streaming():
         ({"n_layers": 0}, "n_layers must be positive"),
         ({"gdn_chunk_size": 0}, "gdn_chunk_size must be positive"),
         ({"mla_num_kv_heads": 0}, "mla_num_kv_heads must be positive"),
+        ({"mla_query_chunk_size": 0}, "mla_query_chunk_size must be positive"),
+        ({"mla_cache_page_size": 0}, "mla_cache_page_size must be positive"),
         ({"moe_top_k": 0}, "moe_top_k must be positive"),
         ({"moe_design_mode": "fast"}, "moe_design_mode"),
         ({"compute_dtype": "float16"}, "compute_dtype"),

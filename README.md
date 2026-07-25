@@ -24,8 +24,24 @@ KimiLinearConfig(
     moe_latent_dim=64,         # None restores full-width routed experts
     moe_design_mode="accuracy", # "accuracy", "efficiency", or "custom"
     mla_gated=True,
+    mla_query_chunk_size=128,  # bounds training score-memory per MLA layer
+    mla_cache_page_size=64,    # page-wise online-softmax decode
 )
 ```
+
+### Memory-efficient MLA
+
+MLA now keeps query heads in a grouped `[KV head, sharing group]` layout, so KV
+latents are broadcast to their query groups instead of being physically repeated.
+During training, causal attention scans fixed-size query chunks and rematerializes
+each chunk in backward; peak score storage is proportional to
+`query_chunk_size * sequence_length` rather than a full square score tensor.
+
+Streaming prefill and decode retain the same compact latent-cache format, but read
+it page by page and merge page results with numerically stable online softmax.
+Unfilled pages skip their attention matmuls, so early decoding work follows the
+filled prefix instead of the configured cache capacity. Cache pages need not
+evenly divide `max_seq_len`.
 
 ### Optimized Attention Residuals
 
