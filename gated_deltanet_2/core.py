@@ -160,8 +160,7 @@ backward is only needed for a fused Triton/Pallas kernel.
 
 Shape conventions (one head): q, k, g, b: [L, dk]; v, w: [L, dv];
 S0: [dk, dv]. Public entry points add leading [B, H] axes via vmap.
-All math runs in fp32 (paper App. D). Every core is verified against
-_recurrent_single and an independent float64 oracle in tests/test_rule.py.
+All math runs in fp32 (paper App. D).
 """
 
 from functools import partial
