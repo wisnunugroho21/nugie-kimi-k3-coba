@@ -56,8 +56,8 @@ class MLACache(NamedTuple):
     pos: jax.Array  # scalar int32: number of filled positions so far
 
 
-class GroupedQueryLatentAttention(nnx.Module):
-    """Grouped-Query attention over a low-rank KV *latent*, in MLA "absorbed" form.
+class GatedGroupedQueryLatentAttention(nnx.Module):
+    """Gated Grouped-Query attention over a low-rank KV *latent*, in MLA "absorbed" form.
 
     This is NoPE (no rotary embeddings) Multi-head Latent Attention written in its
     matrix-absorbed form, fused with GQA-style KV-head sharing. Each of the three
@@ -86,7 +86,6 @@ class GroupedQueryLatentAttention(nnx.Module):
         head_dim: int,
         rngs: nnx.Rngs,
         compute_dtype: jnp.dtype = F32,
-        gated: bool = False,
     ):
         # Matmul dtype for the projections (bf16 on H200); the QK^T / softmax / AV
         # core is upcast to fp32 below regardless, for a stable attention distribution.
@@ -148,17 +147,15 @@ class GroupedQueryLatentAttention(nnx.Module):
         # Xavier gain-2^{-2.5} init the gate starts near sigmoid(0) = 0.5: a
         # uniform half-open gate, so the init-time behavior is a benignly
         # rescaled ungated MLA.
-        self.gated = gated
-        if gated:
-            self.w_gate = nnx.Linear(
-                embed_dim,
-                d_q,
-                use_bias=False,
-                kernel_init=_XAVIER,
-                dtype=compute_dtype,
-                param_dtype=F32,
-                rngs=rngs,
-            )
+        self.w_gate = nnx.Linear(
+            embed_dim,
+            d_q,
+            use_bias=False,
+            kernel_init=_XAVIER,
+            dtype=compute_dtype,
+            param_dtype=F32,
+            rngs=rngs,
+        )
 
     def _output_gate(self, o: jax.Array, x: jax.Array) -> jax.Array:
         """sigmoid(W_g x) ⊙ o. o: [B, L, Hq*Dh] attention output, x: [B, L,
@@ -183,6 +180,15 @@ class GroupedQueryLatentAttention(nnx.Module):
         # Move the head axis next to batch for batched matmuls: (B, Hq, T, Dh)
         q_heads = q_reshaped.swapaxes(1, 2)
 
+        # Split query heads into KV groups without repeating the cached KV tensor.
+        q_grouped = q_heads.reshape(
+            batch_size,
+            self.num_kv_heads,
+            self.group_size,
+            seq_length,
+            self.head_dim,
+        )  # [B, Hkv, G, T, Dh]
+
         # --- Shared KV latent (serves as both keys and values) ---
         l_kv = self.w_dkv(x)  # (B, T, num_kv_heads * head_dim)
 
@@ -192,16 +198,13 @@ class GroupedQueryLatentAttention(nnx.Module):
 
         l_kv_heads = l_kv_reshaped.swapaxes(1, 2)  # (B, Hkv, T, Dh)
 
-        # GQA tiling: repeat each latent head `group_size` times so it lines up
-        # with the query heads. `repeat` interleaves, so KV head i feeds query
-        # heads [i*group_size : (i+1)*group_size]. Result: (B, Hq, T, Dh).
-        # (This materializes the full Hq KV stack; broadcasting would save memory
-        # but materializing keeps the einsums simple.)
-        l_kv_repeated = l_kv_heads.repeat(self.group_size, axis=1)
-
         # --- Attention scores: Q . K^T, contracting the latent feature dim `d` ---
         # 'd' is shared (contracted); 'k' indexes key/latent positions (kept).
-        qk_t = jnp.einsum("bhqd, bhkd -> bhqk", q_heads, l_kv_repeated)  # (B, Hq, T, T)
+        qk_t = jnp.einsum(
+            "bhgqd,bhkd->bhgqk",
+            q_grouped,
+            l_kv_heads,
+        )  # [B, Hkv, G, T, T]
 
         # Scale by sqrt of the latent per-head dim. Upcast to fp32 so the masking,
         # softmax max/exp/sum are stable even when the projections ran in bf16.
@@ -213,20 +216,31 @@ class GroupedQueryLatentAttention(nnx.Module):
         # the module state or in checkpoints. Safe to use -inf because the diagonal
         # is always kept (no fully-masked rows -> the softmax cannot NaN).
         causal_mask = jnp.tril(jnp.ones((seq_length, seq_length), dtype=bool))
-        scaled_logits = jnp.where(causal_mask[None, None], scaled_logits, -jnp.inf)
+        scaled_logits = jnp.where(
+            causal_mask[None, None, None],
+            scaled_logits,
+            -jnp.inf,
+        )  # [B, Hkv, G, T, T]
 
         # Softmax over the key axis -> per-query attention distribution (fp32), then
         # back to the compute dtype for the (bf16) weighted-sum matmul below.
         a = jax.nn.softmax(scaled_logits, axis=-1).astype(
-            l_kv_repeated.dtype
-        )  # (B, Hq, T, T)
+            l_kv_heads.dtype
+        )  # [B, Hkv, G, T, T]
 
         # --- Weighted sum of value-latents ---
         # 'k' is shared between the weights and the value positions, so it is the
         # contracted axis (the actual attention sum); 'd' is the kept feature dim.
         # Because keys and values are the same latent, l_kv_repeated reappears here.
         weighted_heads = jnp.einsum(
-            "bhqk, bhkd -> bhqd", a, l_kv_repeated
+            "bhgqk,bhkd->bhgqd",
+            a,
+            l_kv_heads,
+        ).reshape(
+            batch_size,
+            self.num_q_heads,
+            seq_length,
+            self.head_dim,
         )  # (B, Hq, T, Dh)
 
         # Move head axis back and flatten heads: (B, T, Hq, Dh) -> (B, T, Hq*Dh)
@@ -236,8 +250,7 @@ class GroupedQueryLatentAttention(nnx.Module):
         )
 
         # Gated MLA (K3): sigmoid output gate before the absorbed out-projection.
-        if self.gated:
-            weighted_latents = self._output_gate(weighted_latents, x)
+        weighted_latents = self._output_gate(weighted_latents, x)
 
         # Absorbed W_UV . W_O: up-project the value latent and output-project.
         output = self.w_uv_o(weighted_latents)  # (B, T, embed_dim)
@@ -272,6 +285,15 @@ class GroupedQueryLatentAttention(nnx.Module):
             self.w_q_uk(x).reshape(B, L, self.num_q_heads, self.head_dim).swapaxes(1, 2)
         )  # (B, Hq, L, Dh)
 
+        # Split query heads into KV groups without repeating the cached KV tensor.
+        q_grouped = q_heads.reshape(
+            B,
+            self.num_kv_heads,
+            self.group_size,
+            L,
+            self.head_dim,
+        )  # [B, Hkv, G, L, Dh]
+
         # New latents -> write them into the cache buffer at the current position.
         l_new = self.w_dkv(x)  # (B, L, Hkv*Dh)
         l_kv = jax.lax.dynamic_update_slice(
@@ -288,9 +310,12 @@ class GroupedQueryLatentAttention(nnx.Module):
         # fp32 for the mask/softmax exactly as the training __call__ path does — the
         # projections may run in bf16, but the attention distribution must be built
         # in fp32 so prefill/decode stay numerically consistent with training.
-        logits = jnp.einsum("bhqd, bhkd -> bhqk", q_heads, l_kv_rep).astype(
-            F32
-        ) / jnp.sqrt(self.head_dim)
+        logits = jnp.einsum(
+            "bhgqd,bhkd->bhgqk",
+            q_grouped,
+            l_kv_heads,
+        ).astype(F32) / jnp.sqrt(self.head_dim)
+        # [B, Hkv, G, L, max_len]
 
         # Causal mask offset by the cache position: query i sits at absolute position
         # pos+i and may attend to slot j iff j <= pos+i.  This also masks the not-yet-
@@ -298,23 +323,33 @@ class GroupedQueryLatentAttention(nnx.Module):
         q_pos = cache.pos + jnp.arange(L)  # (L,)
         k_pos = jnp.arange(max_len)  # (max_len,)
         mask = k_pos[None, :] <= q_pos[:, None]  # (L, max_len)
-        logits = jnp.where(mask[None, None], logits, -jnp.inf)
+
+        logits = jnp.where(
+            mask[None, None, None, :, :],
+            logits,
+            -jnp.inf,
+        )
 
         # Softmax over the key axis -> per-query attention distribution (fp32), then
         # back to the compute dtype for the (bf16) weighted-sum matmul below.
-        a = jax.nn.softmax(logits, axis=-1).astype(l_kv_rep.dtype)
+        a = jax.nn.softmax(logits, axis=-1).astype(l_kv_heads.dtype)
 
         # Weighted sum of value-latents: the same latent serves as both K and V.
-        weighted = jnp.einsum("bhqk, bhkd -> bhqd", a, l_kv_rep)  # (B, Hq, L, Dh)
-        weighted = weighted.swapaxes(1, 2).reshape(
-            B, L, self.num_q_heads * self.head_dim
+        weighted = jnp.einsum(
+            "bhgqk,bhkd->bhgqd",
+            a,
+            l_kv_heads,
+        )  # (B, Hq, L, Dh)
+        weighted = (
+            weighted.reshape(B, self.num_q_heads, L, self.head_dim)
+            .swapaxes(1, 2)
+            .reshape(B, L, self.num_q_heads * self.head_dim)
         )
 
         # Gated MLA (K3): same sigmoid gate as the training path. The gate
         # depends only on the CURRENT positions' x — never on past positions —
         # so streaming needs no extra cache and prefill/decode match training.
-        if self.gated:
-            weighted = self._output_gate(weighted, x)
+        weighted = self._output_gate(weighted, x)
 
         output = self.w_uv_o(weighted)  # (B, L, embed_dim)
         return output, MLACache(l_kv, new_pos)
