@@ -304,7 +304,6 @@ class GatedGroupedQueryLatentAttention(nnx.Module):
         l_kv_heads = l_kv.reshape(
             B, max_len, self.num_kv_heads, self.head_dim
         ).swapaxes(1, 2)  # (B, Hkv, max_len, Dh)
-        l_kv_rep = l_kv_heads.repeat(self.group_size, axis=1)  # (B, Hq, max_len, Dh)
 
         # Scores: the L new queries attend over all max_len cached slots. Upcast to
         # fp32 for the mask/softmax exactly as the training __call__ path does — the
