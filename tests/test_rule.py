@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import numpy as np
-import pytest
-
 import jax
 import jax.numpy as jnp
+import numpy as np
+import pytest
 
 from gated_deltanet_2.core import (
     chunkwise_gated_delta_rule_2,

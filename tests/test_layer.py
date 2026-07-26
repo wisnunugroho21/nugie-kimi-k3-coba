@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import numpy as np
-import pytest
-
 import jax
 import jax.numpy as jnp
+import numpy as np
+import pytest
 from flax import nnx
 
 from gated_deltanet_2.layer import GatedDeltaNet2, LowRankLinear
