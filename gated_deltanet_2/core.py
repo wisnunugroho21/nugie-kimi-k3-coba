@@ -160,7 +160,10 @@ backward is only needed for a fused Triton/Pallas kernel.
 
 Shape conventions (one head): q, k, g, b: [L, dk]; v, w: [L, dv];
 S0: [dk, dv]. Public entry points add leading [B, H] axes via vmap.
-All math runs in fp32 (paper App. D).
+This implementation runs all internal recurrence math in fp32. Appendix D.3
+requires fp32 state and accumulators, while allowing some recomputed WY
+auxiliaries to use the model dtype. Tests compare every core with
+_recurrent_single and an independent float64 oracle in tests/test_rule.py.
 """
 
 from functools import partial
@@ -231,8 +234,9 @@ def _recurrent_single(
         # the RESIDUAL between the gated target z_t and the recalled r_t, at
         # key k_t. If memory already holds the target, nothing is written
         # (no unbounded accumulation, unlike vanilla linear attention).
-        # Also one gradient step on ½‖Sᵀk_t − target‖² (fast-weight view,
-        # Eqs. 13-15).                                             [dk, dv]
+        # In the fast-weight view this is the exact minimizer of the local
+        # proximal/linear objective in Eqs. 13-15. It is not ordinary squared
+        # regression when e_t and k_t are independent directions. [dk, dv]
         S_new = S_bar + kt * (zt - r_t).T
 
         # Eq. 1:  o_t = S_tᵀ q_t — read the post-update memory.     [dv, 1]

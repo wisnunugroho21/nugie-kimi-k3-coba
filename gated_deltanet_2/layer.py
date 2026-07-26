@@ -7,11 +7,11 @@ notes in Appendix D.
 Block design (Fig. 1 right; Sec. 3.5 "Gated DeltaNet-2 token mixer"):
   q,k = L2norm(SiLU(ShortConv(Linear(x))))      # key-side paths + L2 norm (Sec. 3.5, App. D.2)
   v   =        SiLU(ShortConv(Linear(x)))        # value path (Sec. 3.5; Fig. 1 caption)
-  g   = -exp(a) ⊙ softplus(Linear_f(x) + delta)  # log-decay, fp32 (Eq. 12 / 86, App. D.1)
-  b   = sigmoid(Linear_b(x))                     # erase gate (Eq. 11 / 85); x2 if neg-eigenvalue
-  w   = sigmoid(Linear_w(x))                     # write gate (Eq. 11 / 85)
+  g   = -exp(a) ⊙ softplus(Proj_f(x) + delta)    # log-decay, fp32 (Eq. 12 / 86, App. D.1)
+  b   = sigmoid(Proj_b(x))                       # erase gate (Eq. 11 / 85); x2 if neg-eigenvalue
+  w   = sigmoid(Proj_w(x))                       # write gate (Eq. 11 / 85)
   O   = chunkwise_gated_delta_rule_2(q,k,v,g,b,w, state)   # Gated Delta Rule-2 (Eq. 10)
-  out = Linear_o( RMSNorm(O) * SiLU(Linear_g(x)) )  # gated RMSNorm + out proj (Sec. 3.5, App. D.5)
+  out = Linear_o( RMSNorm(O) * SiLU(Proj_g(x)) )  # gated RMSNorm + out proj (Sec. 3.5, App. D.5)
 
 Grouped value heads (Sec. 3.5 last sentence / App. C.1): with num_v_heads = G*num_heads,
 the key-side tensors q, k, the log-decay g, and b are shared across the G value heads
@@ -27,19 +27,19 @@ Scope: this is the recurrent TOKEN MIXER only (Fig. 1 right). The recurrent mode
 Sliding-Window Attention after it, repeating the cell [GDN-2, MLP, SWA, MLP]
 (Fig. 1 left). Those wrappers are not implemented here.
 
-Parameterization notes (App. C.1 / D.5):
+Parameterization notes (App. C.1 / D.5 and the paper-linked reference code):
   * 'a' is stored per key HEAD ([H]) and broadcast across the d_k channels of
     that head; the bias δ is stored per key channel ([H·d_k]) — both exactly
     as App. C.1 specifies.
   * All Linear kernels use Xavier-uniform init with gain 2^{-2.5}; biases are
     zero when present (App. D.5).
-  * a and δ are initialized with the Gated DeltaNet family recipe that
-    App. D.5 refers to: a = log U(1, 16) (a spread of per-head forgetting
-    timescales) and δ = softplus⁻¹(dt) with dt log-uniform in [1e-3, 1e-1]
-    (small initial per-token decay — long memory at init).
-  * The conv kernel width (default 4) is an implementation choice: the paper
-    says only "short causal convolution" (the Mamba/GatedDeltaNet lineage
-    default).
+  * a and δ follow the paper-linked reference initialization:
+    a = log U(1, 16), and δ = softplus⁻¹(dt) with dt log-uniform in
+    [1e-3, 1e-1]. The PDF specifies their shapes and use, but not this init.
+  * The projection factorization and convolution details that the PDF leaves
+    implicit follow the reference code: Proj_f and the output gate use a
+    head_v_dim bottleneck; b, w, f, and the depthwise convolutions are biasless.
+    The short-convolution width is 4 by default.
 """
 
 from typing import NamedTuple
@@ -80,8 +80,10 @@ class GDN2Cache(NamedTuple):
 
 
 class RMSNorm(nnx.Module):
-    """Plain RMSNorm used for the pre-norms around mixer / channel-mixer.
-    Takes no rngs: its only parameter is the deterministic all-ones gain."""
+    """Plain RMSNorm used by the recurrent output stage.
+
+    Takes no rngs: its only parameter is the deterministic all-ones gain.
+    """
 
     def __init__(self, dim: int, *, eps: float = 1e-5):
         self.eps = eps
@@ -97,10 +99,51 @@ class RMSNorm(nnx.Module):
         return (xf * rms * self.weight[...]).astype(x.dtype)
 
 
+class LowRankLinear(nnx.Module):
+    """Two-layer projection used by the reference decay and output-gate paths.
+
+    Computes ``up(down(x))`` with a narrow per-value-head bottleneck. Both
+    kernels use the paper's Xavier-uniform initialization; only the up
+    projection optionally has a bias.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        rank: int,
+        out_features: int,
+        *,
+        use_bias: bool,
+        compute_dtype: jnp.dtype,
+        rngs: nnx.Rngs,
+    ):
+        self.down = nnx.Linear(
+            in_features,
+            rank,
+            use_bias=False,
+            kernel_init=_XAVIER,
+            dtype=compute_dtype,
+            param_dtype=F32,
+            rngs=rngs,
+        )
+        self.up = nnx.Linear(
+            rank,
+            out_features,
+            use_bias=use_bias,
+            kernel_init=_XAVIER,
+            dtype=compute_dtype,
+            param_dtype=F32,
+            rngs=rngs,
+        )
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        return self.up(self.down(x))
+
+
 class GatedRMSNorm(nnx.Module):
     """Head-wise RMSNorm of the recurrent output, gated by a SiLU gate.
 
-    Implements Gated DeltaNet-2 Eq. 10's output stage:
+    Implements the output stage in Sec. 3.5 and Appendix D.5:
 
         SiLU(W↑g W↓g x) ⊙ RMSNorm(O)
 
@@ -116,10 +159,18 @@ class GatedRMSNorm(nnx.Module):
         gate_rank: int,
         *,
         eps: float = 1e-5,
+        compute_dtype: jnp.dtype,
         rngs: nnx.Rngs,
     ):
         self.norm = RMSNorm(head_dim, eps=eps)
-        self.gate = nnx.Param(jnp.ones((inner_dim,)))
+        self.gate = LowRankLinear(
+            d_model,
+            gate_rank,
+            inner_dim,
+            use_bias=True,
+            compute_dtype=compute_dtype,
+            rngs=rngs,
+        )
 
     def __call__(self, O_heads: jax.Array, x: jax.Array) -> jax.Array:
         """O_heads: [B, L, Hv, dv]   x: [B, L, d_model]  ->  [B, L, Hv*dv]."""
@@ -128,8 +179,7 @@ class GatedRMSNorm(nnx.Module):
         o = O_heads.astype(F32)  # [B,L,Hv,dv] -> fp32 for RMSNorm
         o = self.norm(o)  # head-wise RMSNorm
 
-        g = self.gate(x).astype(F32)  # gate
-        g = jax.nn.silu(g)  # SiLU gate
+        g = jax.nn.silu(self.gate(x).astype(F32))
         g = g.reshape(B, L, Hv, dv)
 
         return (o * g).reshape(B, L, Hv * dv)
@@ -141,7 +191,7 @@ class ShortConv(nnx.Module):
     The paper says only "short causal convolution"; the kernel width (default 4)
     is an implementation choice, as in the Mamba/GatedDeltaNet lineage.
 
-    nnx.Conv is channels-last ([B, L, C]) and owns the kernel+bias, so the manual
+    nnx.Conv is channels-last ([B, L, C]) and owns the kernel, so the manual
     NCW transposes and the raw conv call disappear. Padding is fixed at construction,
     so we run the conv in 'VALID' mode and keep the causal left-context / streaming
     state ourselves (state = the trailing kernel_size-1 inputs).
@@ -150,16 +200,16 @@ class ShortConv(nnx.Module):
     def __init__(self, channels: int, kernel_size: int = 4, *, rngs: nnx.Rngs):
         self.channels = channels
         self.kernel_size = kernel_size
-        # Kernel/bias keep the nnx.Conv defaults (LeCun-normal / zeros):
-        # App. D.5's Xavier-gain rule covers "all linear layers", and the paper
-        # is silent on the short-conv init, so the lineage default stands.
+        # The PDF is silent on convolution initialization. Keep NNX's default
+        # kernel initialization and match the paper-linked reference's
+        # biasless depthwise convolution.
         self.conv = nnx.Conv(
             in_features=channels,
             out_features=channels,
             kernel_size=(kernel_size,),
             feature_group_count=channels,  # depthwise: one filter per channel
             padding="VALID",  # left context supplied manually below
-            use_bias=True,
+            use_bias=False,
             rngs=rngs,
         )
 
@@ -192,11 +242,12 @@ class ShortConv(nnx.Module):
         # just a dot of each channel's kernel with its (kernel_size)-token
         # window — cheaper than dispatching a general convolution. Same math
         # as _apply (verified by the decode test in test_layer.py).
-        if x.shape[1] == 1 and self.conv.bias is not None:
+        if x.shape[1] == 1:
             window = jnp.concatenate([conv_state, x], axis=1)  # [B, W, C]
             kernel = self.conv.kernel[...][:, 0, :]  # depthwise [W, 1, C] -> [W, C]
             y = jnp.einsum("bwc,wc->bc", window, kernel)[:, None, :]
-            y = y + self.conv.bias[...]
+            if self.conv.bias is not None:
+                y = y + self.conv.bias[...]
             return y, window[:, 1:, :]
         return self._apply(x, conv_state)
 
@@ -215,23 +266,34 @@ class GatedDeltaNet2(nnx.Module):
         conv_size: int = 4,
         expanded_erase: bool = False,  # erase gate in [0,2] (neg-eigenvalue variant; Sec. 3.1, App. C.1)
         compute_dtype: jnp.dtype = jnp.float32,
-        core: str = "centered",  # rule.py chunkwise core; "subchunking"/"pairwise"
+        core: str = "centered",  # core.py chunkwise core; "subchunking"/"pairwise"
         #   have no decay-range limit if the learned decay outgrows the centered
         #   core's per-chunk |G_C| ~ 176 (see chunkwise_gated_delta_rule_2)
         sub_chunk_size: int = 16,  # c for core="subchunking"; ignored otherwise
         *,
         rngs: nnx.Rngs,
     ):
-        # Matmul dtype for the q/k/v/b/w/o projection Linears (bf16 on H200). The
-        # chunkwise/recurrent core (rule.py) upcasts to fp32 regardless, and the
-        # log-decay branch (f_proj) is kept fp32 below — both for numerical safety
-        # (App. D.1 / D.3).
+        if d_model <= 0 or num_heads <= 0 or head_k_dim <= 0 or head_v_dim <= 0:
+            raise ValueError(
+                "d_model, num_heads, head_k_dim, and head_v_dim must be positive"
+            )
+        if num_v_heads is not None and num_v_heads <= 0:
+            raise ValueError("num_v_heads must be positive when provided")
+        if chunk_size <= 0 or conv_size <= 0:
+            raise ValueError("chunk_size and conv_size must be positive")
+        if sub_chunk_size <= 0:
+            raise ValueError("sub_chunk_size must be positive")
+
+        # Projection matmuls use compute_dtype (bf16 on H200). The recurrent core
+        # upcasts to fp32, and the f_proj result is cast to fp32 before the
+        # log-decay activation, matching Appendix D.1/D.3 and the reference code.
         self.compute_dtype = compute_dtype
         self.d_model = d_model
         self.H = num_heads
-        self.Hv = num_v_heads or num_heads
+        self.Hv = num_heads if num_v_heads is None else num_v_heads
 
-        assert self.Hv % self.H == 0, "num_v_heads must be a multiple of num_heads"
+        if self.Hv % self.H:
+            raise ValueError("num_v_heads must be a multiple of num_heads")
 
         self.group = self.Hv // self.H  # G, value-head group size (App. C.1)
         self.dk = head_k_dim
@@ -277,7 +339,7 @@ class GatedDeltaNet2(nnx.Module):
         self.b_proj = nnx.Linear(
             d_model,
             k_proj_dim,
-            use_bias=True,
+            use_bias=False,
             kernel_init=_XAVIER,
             dtype=compute_dtype,
             param_dtype=F32,
@@ -286,21 +348,20 @@ class GatedDeltaNet2(nnx.Module):
         self.w_proj = nnx.Linear(
             d_model,
             v_proj_dim,
-            use_bias=True,
+            use_bias=False,
             kernel_init=_XAVIER,
             dtype=compute_dtype,
             param_dtype=F32,
             rngs=rngs,
         )  # Proj_w, Eq. 85: w = σ(Proj_w x)
-        self.f_proj = nnx.Linear(
+        self.f_proj = LowRankLinear(
             d_model,
+            self.dv,
             k_proj_dim,
-            use_bias=True,
-            kernel_init=_XAVIER,
-            dtype=compute_dtype,
-            param_dtype=F32,
+            use_bias=False,
+            compute_dtype=compute_dtype,
             rngs=rngs,
-        )  # Proj_f, Eq. 86 (log-decay), d_model -> H·d_k
+        )  # Proj_f, Eq. 86: d_model -> d_v -> H·d_k
 
         # Short causal convs on q, k, v (App. C.1: "short-convolutional projections for q, k, v").
         self.q_conv = ShortConv(k_proj_dim, conv_size, rngs=rngs)
@@ -310,7 +371,7 @@ class GatedDeltaNet2(nnx.Module):
         # Log-decay parameters (Eq. 12 / 86; App. C.1): 'a' is stored PER KEY
         # HEAD ([H]) and broadcast across the d_k channels of that head; the
         # bias δ is stored per key channel ([H·d_k]) and added pre-softplus.
-        # Init follows the Gated DeltaNet family recipe App. D.5 refers to:
+        # Init follows the paper-linked reference implementation:
         #   a = log U(1, 16)  -> exp(a) ∈ [1, 16], a spread of per-head
         #                        base forgetting rates;
         #   δ = softplus⁻¹(dt), dt log-uniform in [1e-3, 1e-1] -> the decay
@@ -336,6 +397,7 @@ class GatedDeltaNet2(nnx.Module):
             d_model=d_model,
             inner_dim=self.Hv * self.dv,
             gate_rank=self.dv,
+            compute_dtype=compute_dtype,
             rngs=rngs,
         )
 
@@ -478,19 +540,70 @@ class GatedDeltaNet2(nnx.Module):
 
         return self.o_proj(o)  # project back to d_model
 
+    def _run_recurrence(
+        self,
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        g: jax.Array,
+        b: jax.Array,
+        w: jax.Array,
+        S: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Run a chunk-aligned prefix followed by an exact recurrent tail.
+
+        This gives training, prefill, and decode one recurrence dispatcher and
+        removes the public layer's former sequence-length divisibility
+        restriction. Inputs use the grouped internal head layout.
+        """
+        L = q.shape[2]
+        if L < 1:
+            raise ValueError("GatedDeltaNet2 requires a non-empty sequence")
+
+        n_full = (L // self.chunk_size) * self.chunk_size
+        outs = []
+
+        if n_full:
+            o_head, S = chunkwise_gated_delta_rule_2(
+                q[:, :, :n_full],
+                k[:, :, :n_full],
+                v[:, :, :n_full],
+                g[:, :, :n_full],
+                b[:, :, :n_full],
+                w[:, :, :n_full],
+                S,
+                chunk_size=self.chunk_size,
+                core=self.core,
+                sub_chunk_size=self.sub_chunk_size,
+            )
+            outs.append(o_head)
+
+        if n_full < L:
+            o_tail, S = recurrent_gated_delta_rule_2(
+                q[:, :, n_full:],
+                k[:, :, n_full:],
+                v[:, :, n_full:],
+                g[:, :, n_full:],
+                b[:, :, n_full:],
+                w[:, :, n_full:],
+                S,
+            )
+            outs.append(o_tail)
+
+        o = outs[0] if len(outs) == 1 else jnp.concatenate(outs, axis=2)
+        return o, S
+
     def __call__(
         self,
         x: jax.Array,
         initial_state: jax.Array | None = None,
         return_state: bool = False,
+        attention_mask: jax.Array | None = None,
     ) -> jax.Array | tuple[jax.Array, jax.Array]:
-        """Full-sequence (training) forward via the CHUNKWISE parallel core.
-        x: [B, L, d_model] -> out: [B, L, d_model], or (out, S_final) with
-        return_state=True.
+        """Full-sequence forward using a chunkwise prefix and recurrent tail.
 
-        L must be divisible by chunk_size (the core validates and raises
-        otherwise) — pad training batches to a multiple of C, or use `step`,
-        which handles ragged lengths via its recurrent tail.
+        x: [B, L, d_model] -> out: [B, L, d_model], or (out, S_final) with
+        return_state=True. Any L >= 1 is supported.
 
         `initial_state` / the returned S_final use the public per-value-head
         layout [B, Hv, dk, dv], so state can be carried across segment calls
@@ -499,30 +612,52 @@ class GatedDeltaNet2(nnx.Module):
         this carries the RECURRENT memory only; the short-conv left context is
         not part of it, so the first conv_size-1 tokens of a continued segment
         see zero-padding instead of the true previous tokens. For exact
-        continuation (inference) use `step`, whose cache carries both."""
-        B, _, _ = x.shape
-        q, k, v, g, b, w, _ = self._project(x, conv_states=None)
+        continuation (inference) use `step`, whose cache carries both.
+
+        `attention_mask`, when provided, has shape [B, L], with nonzero entries
+        marking valid tokens. Masked inputs are zeroed before the causal
+        convolution, and their recurrence is made an exact no-op. This keeps
+        both their output and their contribution to S_final zero, so right
+        padding is safe when carrying state across calls.
+        """
+        B, L, _ = x.shape
+        if L < 1:
+            raise ValueError("GatedDeltaNet2 requires a non-empty sequence")
+
+        if attention_mask is not None:
+            if attention_mask.shape != (B, L):
+                raise ValueError(
+                    f"attention_mask must have shape {(B, L)}, got {attention_mask.shape}"
+                )
+            valid = attention_mask.astype(jnp.bool_)
+            x_project = jnp.where(valid[..., None], x, jnp.zeros((), x.dtype))
+        else:
+            valid = None
+            x_project = x
+
+        q, k, v, g, b, w, _ = self._project(x_project, conv_states=None)
+
+        if valid is not None:
+            # A masked token must neither decay nor edit memory. g=0 makes
+            # alpha=1, while k=0 removes both erase and write terms (Eq. 9).
+            m = valid[:, None, :, None]
+            q = jnp.where(m, q, 0)
+            k = jnp.where(m, k, 0)
+            v = jnp.where(m, v, 0)
+            g = jnp.where(m, g, 0)
+            b = jnp.where(m, b, 0)
+            w = jnp.where(m, w, 0)
 
         if initial_state is None:
             S0 = jnp.zeros((B, self.H, self.dk, self.group * self.dv), jnp.float32)
         else:
             S0 = self._state_in(initial_state)
 
-        # Gated Delta Rule-2 chunkwise core (Eq. 10); forms cumsum γ internally (Eq. 30).
-        o, S_final = chunkwise_gated_delta_rule_2(
-            q,
-            k,
-            v,
-            g,
-            b,
-            w,
-            S0,
-            chunk_size=self.chunk_size,
-            core=self.core,
-            sub_chunk_size=self.sub_chunk_size,
-        )
+        o, S_final = self._run_recurrence(q, k, v, g, b, w, S0)
 
         out = self._output(o, x)
+        if valid is not None:
+            out = jnp.where(valid[..., None], out, 0)
         if return_state:
             return out, self._state_out(S_final)
         return out
@@ -574,6 +709,9 @@ class GatedDeltaNet2(nnx.Module):
         which is what dominates on accelerators. On CPU the recurrent scan is
         already compute-bound and the chunkwise core's pairwise-ratio tensor
         costs O(L·C·dk), so there the chunkwise path only wins for small C."""
+        if x.shape[1] < 1:
+            raise ValueError("GatedDeltaNet2.step requires a non-empty sequence")
+
         q, k, v, g, b, w, new_conv = self._project(
             x, conv_states=(cache.q_conv, cache.k_conv, cache.v_conv)
         )
@@ -583,43 +721,8 @@ class GatedDeltaNet2(nnx.Module):
         assert new_conv is not None
         qcs, kcs, vcs = new_conv
 
-        L = x.shape[1]
-        n_full = (L // self.chunk_size) * self.chunk_size  # chunk-aligned prefix
         # Cache holds the public per-value-head layout; the cores consume the
         # grouped one (see _state_in/_state_out).
         S = self._state_in(cache.recurrent_state)
-        outs = []
-
-        if n_full > 0:
-            # Chunkwise prefill of the aligned prefix (Eq. 18-25), warm-started
-            # from — and updating — the running state S.
-            o_head, S = chunkwise_gated_delta_rule_2(
-                q[:, :, :n_full],
-                k[:, :, :n_full],
-                v[:, :, :n_full],
-                g[:, :, :n_full],
-                b[:, :, :n_full],
-                w[:, :, :n_full],
-                S,
-                chunk_size=self.chunk_size,
-                core=self.core,
-                sub_chunk_size=self.sub_chunk_size,
-            )
-            outs.append(o_head)
-
-        if n_full < L:
-            # Ragged tail (or the whole input when L < C, e.g. the decode step):
-            # recurrent core, token-by-token (Eq. 9 / 29).
-            o_tail, S = recurrent_gated_delta_rule_2(
-                q[:, :, n_full:],
-                k[:, :, n_full:],
-                v[:, :, n_full:],
-                g[:, :, n_full:],
-                b[:, :, n_full:],
-                w[:, :, n_full:],
-                S,
-            )
-            outs.append(o_tail)
-
-        o = outs[0] if len(outs) == 1 else jnp.concatenate(outs, axis=2)
+        o, S = self._run_recurrence(q, k, v, g, b, w, S)
         return self._output(o, x), GDN2Cache(self._state_out(S), qcs, kcs, vcs)
