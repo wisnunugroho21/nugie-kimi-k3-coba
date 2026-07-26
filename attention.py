@@ -1,31 +1,26 @@
-"""Gated NoPE Multi-head Latent Attention (MLA) — the FULL-attention token mixer
-of our Kimi K3 recreation.
+"""Gated NoPE Grouped-Query Latent Attention (MLA) — the FULL-attention token mixer.
 
-In the K3 hybrid (inherited from Kimi Linear), 1 of every 4 layers is ordinary
-softmax attention; this module is that layer:
+1 of every 4 layers is ordinary softmax attention; this module is that layer:
 
   * MLA (DeepSeek-V2 lineage): keys/values live in a small shared low-rank LATENT,
     so the decode-time cache stores one latent vector per position instead of full
     K and V — the whole point of MLA is that tiny KV cache.
-  * NoPE — NO positional encoding of any kind. The linear-attention layers (KDA
-    in K3; GDN-2 here) already encode position implicitly through their
-    recurrence, so the hybrid drops RoPE from its full-attention layers entirely
-    (Kimi Linear Sec. 3.3, "NoPE"; K3 keeps the recipe).
+  * NoPE — NO positional encoding of any kind. The linear-attention layers (GDN-2)
+    already encode position implicitly through their recurrence, so the hybrid drops
+    RoPE from its full-attention layers entirely (Kimi Linear Sec. 3.3, "NoPE").
   * Written in the ABSORBED form (see the class docstring): with no RoPE in the
     way, the K/V up-projections fold into the neighboring matrices exactly, so the
     latent itself serves as both K and V and never gets up-projected at runtime.
-  * GATED MLA (Kimi K3: "Gated MLA improves attention selectivity"): a head-wise
-    sigmoid output gate applied to the attention output right before the final
-    (absorbed) output projection,
+  * GATED MLA : a head-wise sigmoid output gate applied to the attention output right
+    before the final (absorbed) output projection,
 
         o_gated = sigmoid(W_g x) ⊙ o
 
     This is the selectivity gate of the "Gated Attention" lineage
     (arXiv:2505.06708 — the input-conditioned, head-specific elementwise output
     gate Kimi K2 adopted, which suppresses attention sinks and massive
-    activations). K3's exact gate formulation awaits its technical report; this
-    is the lineage-faithful reading of the blog's description. Behind the
-    `gated` flag (the model config enables it by default via mla_gated).
+    activations). this is the lineage-faithful reading of the blog's description.
+    Behind the `gated` flag (the model config enables it by default via mla_gated).
 
 Two paths, same math: `__call__` for full-sequence training (causal-masked matrix
 attention) and `step` for streaming decode (append the new latent to a preallocated
@@ -140,7 +135,7 @@ class GatedGroupedQueryLatentAttention(nnx.Module):
             rngs=rngs,
         )
 
-        # Gated MLA (Kimi K3): sigmoid output gate — sigmoid(W_g x) ⊙ o —
+        # Gated MLA: sigmoid output gate — sigmoid(W_g x) ⊙ o —
         # applied to the per-head attention output BEFORE w_uv_o (the G1
         # "before out-projection" position of the Gated Attention paper,
         # head-specific and elementwise over the d_q gate width). With the
@@ -345,7 +340,7 @@ class GatedGroupedQueryLatentAttention(nnx.Module):
             .reshape(B, L, self.num_q_heads * self.head_dim)
         )
 
-        # Gated MLA (K3): same sigmoid gate as the training path. The gate
+        # Gated MLA: same sigmoid gate as the training path. The gate
         # depends only on the CURRENT positions' x — never on past positions —
         # so streaming needs no extra cache and prefill/decode match training.
         weighted = self._output_gate(weighted, x)
