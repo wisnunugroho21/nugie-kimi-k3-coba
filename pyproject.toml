@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mini-kimi-k3"
+version = "0.1.0"
+description = "A small, educational Kimi K3 text-backbone implementation in JAX and Flax NNX"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "flax>=0.10.2",
+  "jax>=0.4.35",
+]
+
+[project.optional-dependencies]
+dev = [
+  "optax>=0.2.4",
+  "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.hatch.build.targets.wheel]
+packages = ["kimi_k3"]
