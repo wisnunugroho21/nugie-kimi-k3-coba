@@ -1,8 +1,11 @@
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 from jax import lax
 
 D_TYPE = jnp.float32
+
 
 def _recurrent_step(
     q: jax.Array,
@@ -43,6 +46,7 @@ def _recurrent_step(
 
     S_final, o = lax.scan(step, S0, (q, k, alpha, e, z))
     return o.squeeze(-1), S_final
+
 
 def _chunkwise_step(
     q: jax.Array,
@@ -111,9 +115,13 @@ def _chunkwise_step(
     S_final, o = lax.scan(chunk_step, S0, (Y, U, Aqk, Qg, Ktail, gamma_C))
     return o.reshape(-1, o.shape[-1]), S_final
 
-def _batchify(fn):
+
+def _batchify(fn, **static_kwargs):
+    if static_kwargs:
+        fn = partial(fn, **static_kwargs)
     over_heads = jax.vmap(fn, in_axes=(0, 0, 0, 0, 0, 0, 0), out_axes=(0, 0))
     return jax.vmap(over_heads, in_axes=(0, 0, 0, 0, 0, 0, 0), out_axes=(0, 0))
+
 
 def recurrent_gated_delta_rule_2(
     q: jax.Array,
@@ -126,6 +134,7 @@ def recurrent_gated_delta_rule_2(
 ) -> tuple[jax.Array, jax.Array]:
     return _batchify(_recurrent_step)(q, k, v, g, b, w, S0)
 
+
 def chunkwise_gated_delta_rule_2(
     q: jax.Array,
     k: jax.Array,
@@ -134,6 +143,6 @@ def chunkwise_gated_delta_rule_2(
     b: jax.Array,
     w: jax.Array,
     S0: jax.Array,
-    chunk_size: int = 64
+    chunk_size: int = 64,
 ) -> tuple[jax.Array, jax.Array]:
     return _batchify(_chunkwise_step)(q, k, v, g, b, w, S0, chunk_size)
