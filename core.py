@@ -76,6 +76,7 @@ def gated_delta_rule_2_recurrent(
         S_t = S_bar + k_t residual.T
     """
     _check_shapes(q, k, v, log_decay, erase_gate, write_gate)
+    output_dtype = v.dtype
     state = _initial_state(q, v, initial_state)
 
     # lax.scan iterates over its leading axis, so move time to the front.
@@ -102,7 +103,7 @@ def gated_delta_rule_2_recurrent(
         return state, output
 
     final_state, output = jax.lax.scan(step, state, tokens)
-    return jnp.moveaxis(output, 0, 1), final_state
+    return jnp.moveaxis(output, 0, 1).astype(output_dtype), final_state
 
 
 def gated_delta_rule_2_chunkwise(
@@ -127,6 +128,7 @@ def gated_delta_rule_2_chunkwise(
     The decay normalization uses fp32, as does the official implementation.
     """
     _check_shapes(q, k, v, log_decay, erase_gate, write_gate)
+    output_dtype = v.dtype
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
 
@@ -200,7 +202,7 @@ def gated_delta_rule_2_chunkwise(
     # [chunks,B,H,C,V] -> [B,T,H,V], then discard the padded outputs.
     output = output_chunks.transpose(1, 0, 3, 2, 4)
     output = output.reshape(batch, num_chunks * chunk_size, heads, value_dim)
-    return output[:, :length], final_state
+    return output[:, :length].astype(output_dtype), final_state
 
 
 class GatedDeltaNet2(nnx.Module):

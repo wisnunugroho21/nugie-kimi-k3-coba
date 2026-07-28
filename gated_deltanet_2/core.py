@@ -112,8 +112,8 @@ def _chunkwise_step(
     return o.reshape(-1, o.shape[-1]), S_final
 
 def _batchify(fn):
-    over_heads = jax.vmap(fn)
-    return jax.vmap(over_heads)
+    over_heads = jax.vmap(fn, in_axes=(0, 0, 0, 0, 0, 0, 0), out_axes=(0, 0))
+    return jax.vmap(over_heads, in_axes=(0, 0, 0, 0, 0, 0, 0), out_axes=(0, 0))
 
 def recurrent_gated_delta_rule_2(
     q: jax.Array,
