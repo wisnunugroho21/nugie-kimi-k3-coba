@@ -52,3 +52,19 @@ class GatedRMSNorm(nnx.Module):
         g = g.reshape(B, L, Hv, dv)
 
         return (o * g).reshape(B, L, Hv * dv)
+
+
+class ShortConv(nnx.Module):
+    def __init__(self, d_model: int, kernel_size: int, *, rngs: nnx.Rngs) -> None:
+        self.conv = nnx.Conv(
+            in_features=d_model,
+            out_features=d_model,
+            kernel_size=kernel_size,
+            feature_group_count=d_model,
+            use_bias=False,
+            padding="CAUSAL",
+            rngs=rngs,
+        )
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        return self.conv(x)
