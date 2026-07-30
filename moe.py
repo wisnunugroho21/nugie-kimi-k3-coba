@@ -6,6 +6,8 @@ from jax.nn import initializers
 
 
 class TopKRouter(nnx.Module):
+    """Top-K Gating router with auxiliary load-balancing loss."""
+
     def __init__(
         self, d_model: int, num_routed_experts: int, top_k: int = 2, *, rngs: nnx.Rngs
     ):
@@ -39,15 +41,7 @@ class TopKRouter(nnx.Module):
 
 
 class VectorizedExperts(nnx.Module):
-    """Zero-FLOP Ragged MoE Execution Module for the *routed* experts.
-
-    Identical mechanics to your original — the only conceptual change is
-    that `d_ff` here should be the *segmented* (smaller) FFN width, and
-    `num_experts` the *segmented* (larger) expert count, per DeepSeekMoE's
-    fine-grained segmentation (Sec 3.1 of the paper): split each expert
-    into `m` pieces by shrinking d_ff by m and multiplying both
-    num_experts and top_k by m, keeping total active params/FLOPs fixed.
-    """
+    """Zero-FLOP Ragged MoE Execution Module for the *routed* experts."""
 
     def __init__(self, num_experts: int, d_model: int, d_ff: int, *, rngs: nnx.Rngs):
         self.num_experts = num_experts
