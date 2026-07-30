@@ -39,7 +39,7 @@ def _recurrent_step(
 
         S_bar = at * S
         r_t = S_bar.T @ et
-        S_new = S_bar + kt * (zt - r_t).T
+        S_new = S_bar + kt @ (zt - r_t).T
         o_t = S_new.T @ qt
 
         return S_new, o_t
@@ -101,7 +101,7 @@ def _chunkwise_step(
     Y, U = YU[..., :dk], YU[..., dk:]
 
     Aqk = jnp.tril(Qg @ Kbar.swapaxes(-1, -2))
-    Ktail = k * (gamma_C[:, None, :] / gamma)
+    Ktail = k * jnp.exp(G[:, -1:, :] - G)  # Ktail = k * (gamma_C[:, None, :] / gamma)
 
     def chunk_step(S_0, inp):
         Y_n, U_n, Aqk_n, Qg_n, Ktail_n, gamma_C_n = inp
