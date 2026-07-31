@@ -48,7 +48,7 @@ def _recurrent_step(
     return o.squeeze(-1), S_final
 
 
-def _chunkwise_step_faithful(
+def _chunkwise_faithful_step(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
@@ -60,10 +60,12 @@ def _chunkwise_step_faithful(
 ) -> tuple[jax.Array, jax.Array]:
     L = k.shape[0]
     C = chunk_size
+
     if C <= 0 or L % C:
         raise ValueError(
             f"chunk_size={C} must be a positive divisor of the sequence length L={L}"
         )
+
     N = L // C
 
     def to_chunks(x):
@@ -77,6 +79,8 @@ def _chunkwise_step_faithful(
     w = to_chunks(w)
     S0 = S0.astype(D_TYPE)
 
+    eye = jnp.eye(chunk_size, dtype=D_TYPE)
+
     G = jnp.cumsum(g, axis=1)
     gamma = jnp.exp(G)
     gamma_C = gamma[:, -1]
@@ -88,8 +92,6 @@ def _chunkwise_step_faithful(
     Qg = gamma * q
 
     T = jnp.tril(Ebar @ Kbar.swapaxes(-1, -2), k=-1)
-    eye = jnp.eye(T.shape[-1], dtype=T.dtype)
-
     A = jax.scipy.linalg.solve_triangular(
         eye + T, jnp.broadcast_to(eye, T.shape), lower=True, unit_diagonal=True
     )
