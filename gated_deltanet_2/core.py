@@ -48,6 +48,73 @@ def _recurrent_step(
     return o.squeeze(-1), S_final
 
 
+def _chunkwise_faithful_step(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    g: jax.Array,
+    b: jax.Array,
+    w: jax.Array,
+    S0: jax.Array,
+    chunk_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    L = k.shape[0]
+    C = chunk_size
+
+    if C <= 0 or L % C:
+        raise ValueError(
+            f"chunk_size={C} must be a positive divisor of the sequence length L={L}"
+        )
+
+    N = L // C
+
+    def to_chunks(x):
+        return x.reshape(N, C, x.shape[-1]).astype(D_TYPE)
+
+    q = to_chunks(q)
+    k = to_chunks(k)
+    v = to_chunks(v)
+    g = to_chunks(g)
+    b = to_chunks(b)
+    w = to_chunks(w)
+    S0 = S0.astype(D_TYPE)
+
+    eye = jnp.eye(chunk_size, dtype=D_TYPE)
+
+    G = jnp.cumsum(g, axis=1)
+    gamma = jnp.exp(G)
+    gamma_C = gamma[:, -1]
+
+    Kbar = k * jnp.exp(-G)
+    Ebar = gamma * (b * k)
+
+    Z = w * v
+    Qg = gamma * q
+
+    T = jnp.tril(Ebar @ Kbar.swapaxes(-1, -2), k=-1)
+    A = jax.scipy.linalg.solve_triangular(
+        eye + T, jnp.broadcast_to(eye, T.shape), lower=True, unit_diagonal=True
+    )
+
+    Y = A @ Ebar
+    U = A @ Z
+
+    Aqk = jnp.tril(Qg @ Kbar.swapaxes(-1, -2))
+    Ktail = k * (gamma_C[:, None, :] / gamma)
+
+    def chunk_step(S_0, inp):
+        Y_n, U_n, Aqk_n, Qg_n, Ktail_n, gamma_C_n = inp
+
+        R = U_n - Y_n @ S_0
+        o = Qg_n @ S_0 + Aqk_n @ R
+        Sc = gamma_C_n[:, None] * S_0 + Ktail_n.T @ R
+
+        return Sc, o
+
+    S_final, o = lax.scan(chunk_step, S0, (Y, U, Aqk, Qg, Ktail, gamma_C))
+    return o.reshape(-1, o.shape[-1]), S_final
+
+
 def _chunkwise_step(
     q: jax.Array,
     k: jax.Array,
