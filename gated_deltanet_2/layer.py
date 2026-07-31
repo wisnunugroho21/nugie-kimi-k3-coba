@@ -24,6 +24,15 @@ class RMSNorm(nnx.Module):
 
 
 class GatedRMSNorm(nnx.Module):
+    """RMSNorm gated by a low-rank SiLU/Swish projection of the layer input.
+
+    Matches `fla.modules.FusedRMSNormSwishGate` as used by the official
+    GDN-2 `o_norm`: `out = RMSNorm(o) * SiLU(g_proj(x))`, where `g_proj` is
+    itself a rank-`gate_rank` bottleneck (Linear(d_model -> gate_rank,
+    bias=False) -> Linear(gate_rank -> inner_dim, bias=True)), not a single
+    full-rank projection.
+    """
+
     def __init__(
         self,
         head_dim: int,
@@ -35,8 +44,15 @@ class GatedRMSNorm(nnx.Module):
         rngs: nnx.Rngs,
     ):
         self.norm = RMSNorm(head_dim, eps=eps, rngs=rngs)
-        self.gate = nnx.Linear(
-            d_model, inner_dim, use_bias=False, kernel_init=_XAVIER, rngs=rngs
+        # Fix #3: gate_rank now actually defines a low-rank bottleneck,
+        # instead of being an unused constructor argument.
+        self.gate = nnx.Sequential(
+            nnx.Linear(
+                d_model, gate_rank, use_bias=False, kernel_init=_XAVIER, rngs=rngs
+            ),
+            nnx.Linear(
+                gate_rank, inner_dim, use_bias=True, kernel_init=_XAVIER, rngs=rngs
+            ),
         )
 
     def __call__(self, O_heads: jax.Array, x: jax.Array) -> jax.Array:
@@ -46,7 +62,8 @@ class GatedRMSNorm(nnx.Module):
         o = self.norm(o)
 
         g = self.gate(x).astype(F32)
-        g = jax.nn.sigmoid(g)
+        # Fix #2: SiLU/Swish gate, not sigmoid — matches FusedRMSNormSwishGate.
+        g = jax.nn.silu(g)
         g = g.reshape(B, L, Hv, dv)
 
         return (o * g).reshape(B, L, Hv * dv)
@@ -125,10 +142,12 @@ class GatedDeltaNet2(nnx.Module):
             param_dtype=F32,
             rngs=rngs,
         )
+        # Fix #5: b_proj / w_proj are bias-free, matching the official
+        # `nn.Linear(hidden_size, key_dim/value_dim, bias=False)`.
         self.b_proj = nnx.Linear(
             d_model,
             qk_proj_dim,
-            use_bias=True,
+            use_bias=False,
             kernel_init=_XAVIER,
             dtype=compute_dtype,
             param_dtype=F32,
@@ -137,20 +156,36 @@ class GatedDeltaNet2(nnx.Module):
         self.w_proj = nnx.Linear(
             d_model,
             v_proj_dim,
-            use_bias=True,
+            use_bias=False,
             kernel_init=_XAVIER,
             dtype=compute_dtype,
             param_dtype=F32,
             rngs=rngs,
         )
-        self.f_proj = nnx.Linear(
-            d_model,
-            qk_proj_dim,
-            use_bias=True,
-            kernel_init=_XAVIER,
-            dtype=compute_dtype,
-            param_dtype=F32,
-            rngs=rngs,
+        # Fix #4: f_proj is now the low-rank, bias-free bottleneck used by
+        # the reference (Linear(d_model -> head_v_dim, bias=False) ->
+        # Linear(head_v_dim -> key_dim, bias=False)). All bias for the decay
+        # pre-activation lives in dt_bias, as in the reference — f_proj no
+        # longer carries its own (redundant) bias term.
+        self.f_proj = nnx.Sequential(
+            nnx.Linear(
+                d_model,
+                self.dv,
+                use_bias=False,
+                kernel_init=_XAVIER,
+                dtype=compute_dtype,
+                param_dtype=F32,
+                rngs=rngs,
+            ),
+            nnx.Linear(
+                self.dv,
+                qk_proj_dim,
+                use_bias=False,
+                kernel_init=_XAVIER,
+                dtype=compute_dtype,
+                param_dtype=F32,
+                rngs=rngs,
+            ),
         )
 
         self.q_conv = ShortConv(qk_proj_dim, conv_size, rngs=rngs)
@@ -171,6 +206,8 @@ class GatedDeltaNet2(nnx.Module):
         )
         self.dt_bias = nnx.Param(dt + jnp.log(-jnp.expm1(-dt)))
 
+        # Fix #3 (continued): gate_rank = head_v_dim, matching the official
+        # g_proj bottleneck width.
         self.o_norm = GatedRMSNorm(
             head_dim=self.dv,
             d_model=d_model,
@@ -198,8 +235,25 @@ class GatedDeltaNet2(nnx.Module):
     def __call__(
         self,
         x: jax.Array,
+        initial_state: jax.Array | None = None,
         return_state: bool = False,
     ) -> jax.Array | tuple[jax.Array, jax.Array]:
+        """Full-sequence (training) forward via the CHUNKWISE parallel core.
+        x: [B, L, d_model] -> out: [B, L, d_model], or (out, S_final) with
+        return_state=True.
+
+        L must be divisible by chunk_size (the core validates and raises
+        otherwise) — pad training batches to a multiple of C, or use `step`,
+        which handles ragged lengths via its recurrent tail.
+
+        `initial_state` / the returned S_final use the public per-value-head
+        layout [B, Hv, dk, dv], so state can be carried across segment calls
+        (truncated-BPTT-style training: pass S_final of one segment — usually
+        via jax.lax.stop_gradient — as initial_state of the next). CAVEAT:
+        this carries the RECURRENT memory only; the short-conv left context is
+        not part of it, so the first conv_size-1 tokens of a continued segment
+        see zero-padding instead of the true previous tokens. For exact
+        continuation (inference) use `step`, whose cache carries both."""
         B, L, _ = x.shape
 
         q = self.q_conv(self.q_proj(x))
@@ -220,7 +274,8 @@ class GatedDeltaNet2(nnx.Module):
 
         # Log-decay branch, computed in fp32 outside the kernel (Eq. 12 / 86; App. C.1 / D.1).
         #   g_t = -exp(a) ⊙ softplus(Proj_f(x_t) + δ),  then α_t = exp(g_t) inside the core.
-        f_p = self.f_proj(x).astype(jnp.float32)  # [B,L,H*dk]  Proj_f(x) in Eq. 86
+        # Fix #4: Proj_f is now the low-rank, bias-free bottleneck.
+        f_p = self.f_proj(x).astype(jnp.float32)  # [B,L,H*dk]
         d_t = self.dt_bias[...].astype(
             jnp.float32
         )  # [H*dk]  per-channel bias δ, Eq. 86
@@ -258,7 +313,7 @@ class GatedDeltaNet2(nnx.Module):
         o = o.swapaxes(1, 2).reshape(B, L, self.Hv, self.dv)  # ungroup value heads
         o = self.o_norm(o, x).astype(
             x.dtype
-        )  # low-rank SIGMOID output gate computed inside, from x (see GatedRMSNorm)
+        )  # low-rank SILU output gate computed inside, from x (see GatedRMSNorm)
 
         out = self.o_proj(o)  # project back to d_model
 
