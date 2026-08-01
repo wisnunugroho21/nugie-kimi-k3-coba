@@ -91,7 +91,13 @@ class GatedDeltaNet2(nnx.Module):
         self.compute_dtype = compute_dtype
         self.d_model = d_model
         self.H = num_heads
-        self.Hv = num_v_heads or num_heads
+        self.Hv = num_heads if num_v_heads is None else num_v_heads
+
+        if self.Hv < self.H:
+            raise ValueError("num_v_heads must be >= num_heads")
+
+        if self.Hv % self.H != 0:
+            raise ValueError("num_v_heads must be divisible by num_heads")
 
         self.group = self.Hv // self.H
         self.dk = head_k_dim
@@ -251,7 +257,26 @@ class GatedDeltaNet2(nnx.Module):
         w = jax.nn.sigmoid(self.w_proj(x))
         w = self._split_v(w, B, L)
 
-        S0 = jnp.zeros((B, self.H, self.dk, self.group * self.dv), jnp.float32)
+        if initial_state is None:
+            S0 = jnp.zeros(
+                (B, self.H, self.dk, self.group * self.dv),
+                dtype=F32,
+            )
+        else:
+            expected = (B, self.Hv, self.dk, self.dv)
+
+            if initial_state.shape != expected:
+                raise ValueError(
+                    f"initial_state must have shape {expected}, "
+                    f"got {initial_state.shape}"
+                )
+
+            S0 = (
+                initial_state.astype(F32)
+                .reshape(B, self.H, self.group, self.dk, self.dv)
+                .swapaxes(2, 3)
+                .reshape(B, self.H, self.dk, self.group * self.dv)
+            )
 
         o, S_final = chunkwise_gated_delta_rule_2(
             q,
