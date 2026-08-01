@@ -48,7 +48,7 @@ def _recurrent_step(
     return o.squeeze(-1), S_final
 
 
-def _chunkwise_faithful_step(
+def _chunkwise_naive_step(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,

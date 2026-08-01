@@ -24,15 +24,6 @@ class RMSNorm(nnx.Module):
 
 
 class GatedRMSNorm(nnx.Module):
-    """RMSNorm gated by a low-rank SiLU/Swish projection of the layer input.
-
-    Matches `fla.modules.FusedRMSNormSwishGate` as used by the official
-    GDN-2 `o_norm`: `out = RMSNorm(o) * SiLU(g_proj(x))`, where `g_proj` is
-    itself a rank-`gate_rank` bottleneck (Linear(d_model -> gate_rank,
-    bias=False) -> Linear(gate_rank -> inner_dim, bias=True)), not a single
-    full-rank projection.
-    """
-
     def __init__(
         self,
         head_dim: int,
@@ -44,8 +35,6 @@ class GatedRMSNorm(nnx.Module):
         rngs: nnx.Rngs,
     ):
         self.norm = RMSNorm(head_dim, eps=eps, rngs=rngs)
-        # Fix #3: gate_rank now actually defines a low-rank bottleneck,
-        # instead of being an unused constructor argument.
         self.gate = nnx.Sequential(
             nnx.Linear(
                 d_model, gate_rank, use_bias=False, kernel_init=_XAVIER, rngs=rngs
@@ -62,7 +51,6 @@ class GatedRMSNorm(nnx.Module):
         o = self.norm(o)
 
         g = self.gate(x).astype(F32)
-        # Fix #2: SiLU/Swish gate, not sigmoid — matches FusedRMSNormSwishGate.
         g = jax.nn.silu(g)
         g = g.reshape(B, L, Hv, dv)
 
@@ -142,8 +130,6 @@ class GatedDeltaNet2(nnx.Module):
             param_dtype=F32,
             rngs=rngs,
         )
-        # Fix #5: b_proj / w_proj are bias-free, matching the official
-        # `nn.Linear(hidden_size, key_dim/value_dim, bias=False)`.
         self.b_proj = nnx.Linear(
             d_model,
             qk_proj_dim,
@@ -152,7 +138,7 @@ class GatedDeltaNet2(nnx.Module):
             dtype=compute_dtype,
             param_dtype=F32,
             rngs=rngs,
-        )  # Proj_b, Eq. 85: b = σ(Proj_b x)
+        )
         self.w_proj = nnx.Linear(
             d_model,
             v_proj_dim,
@@ -162,11 +148,6 @@ class GatedDeltaNet2(nnx.Module):
             param_dtype=F32,
             rngs=rngs,
         )
-        # Fix #4: f_proj is now the low-rank, bias-free bottleneck used by
-        # the reference (Linear(d_model -> head_v_dim, bias=False) ->
-        # Linear(head_v_dim -> key_dim, bias=False)). All bias for the decay
-        # pre-activation lives in dt_bias, as in the reference — f_proj no
-        # longer carries its own (redundant) bias term.
         self.f_proj = nnx.Sequential(
             nnx.Linear(
                 d_model,
@@ -194,7 +175,7 @@ class GatedDeltaNet2(nnx.Module):
 
         self.A_log = nnx.Param(
             jnp.log(jax.random.uniform(rngs.params(), (self.H,), F32, 1.0, 16.0))
-        )  # 'a' in -exp(a)·softplus(·)
+        )
         dt = jnp.exp(
             jax.random.uniform(
                 rngs.params(),
@@ -206,8 +187,6 @@ class GatedDeltaNet2(nnx.Module):
         )
         self.dt_bias = nnx.Param(dt + jnp.log(-jnp.expm1(-dt)))
 
-        # Fix #3 (continued): gate_rank = head_v_dim, matching the official
-        # g_proj bottleneck width.
         self.o_norm = GatedRMSNorm(
             head_dim=self.dv,
             d_model=d_model,
@@ -227,7 +206,7 @@ class GatedDeltaNet2(nnx.Module):
         )
 
     def _split_qk(self, x: jax.Array, B: int, L: int) -> jax.Array:
-        return x.reshape(B, L, self.H, self.dk).swapaxes(1, 2)  # [B,H,L,dk]
+        return x.reshape(B, L, self.H, self.dk).swapaxes(1, 2)
 
     def _split_v(self, x: jax.Array, B: int, L: int) -> jax.Array:
         return x.reshape(B, L, self.H, self.group * self.dv).swapaxes(1, 2)
@@ -238,22 +217,6 @@ class GatedDeltaNet2(nnx.Module):
         initial_state: jax.Array | None = None,
         return_state: bool = False,
     ) -> jax.Array | tuple[jax.Array, jax.Array]:
-        """Full-sequence (training) forward via the CHUNKWISE parallel core.
-        x: [B, L, d_model] -> out: [B, L, d_model], or (out, S_final) with
-        return_state=True.
-
-        L must be divisible by chunk_size (the core validates and raises
-        otherwise) — pad training batches to a multiple of C, or use `step`,
-        which handles ragged lengths via its recurrent tail.
-
-        `initial_state` / the returned S_final use the public per-value-head
-        layout [B, Hv, dk, dv], so state can be carried across segment calls
-        (truncated-BPTT-style training: pass S_final of one segment — usually
-        via jax.lax.stop_gradient — as initial_state of the next). CAVEAT:
-        this carries the RECURRENT memory only; the short-conv left context is
-        not part of it, so the first conv_size-1 tokens of a continued segment
-        see zero-padding instead of the true previous tokens. For exact
-        continuation (inference) use `step`, whose cache carries both."""
         B, L, _ = x.shape
 
         q = self.q_conv(self.q_proj(x))
@@ -262,42 +225,34 @@ class GatedDeltaNet2(nnx.Module):
 
         q, k, v = jax.nn.silu(q), jax.nn.silu(k), jax.nn.silu(v)
 
-        q = self._split_qk(q, B, L)
-        k = self._split_qk(k, B, L)
+        q = self._split_qk(q, B, L).astype(F32)
+        k = self._split_qk(k, B, L).astype(F32)
         v = self._split_v(v, B, L)
 
-        # L2-normalize q, k per head (Sec. 3.5 "L2 normalization applied to q_t
-        # and k_t"; App. D.2), as x·rsqrt(‖x‖² + ε) — one fused rsqrt instead
-        # of a sqrt and a divide; ε guards the all-zero rows SiLU can produce.
         q = q * jax.lax.rsqrt(jnp.sum(q * q, axis=-1, keepdims=True) + 1e-6)
         k = k * jax.lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + 1e-6)
 
-        # Log-decay branch, computed in fp32 outside the kernel (Eq. 12 / 86; App. C.1 / D.1).
-        #   g_t = -exp(a) ⊙ softplus(Proj_f(x_t) + δ),  then α_t = exp(g_t) inside the core.
-        # Fix #4: Proj_f is now the low-rank, bias-free bottleneck.
-        f_p = self.f_proj(x).astype(jnp.float32)  # [B,L,H*dk]
-        d_t = self.dt_bias[...].astype(
-            jnp.float32
-        )  # [H*dk]  per-channel bias δ, Eq. 86
-        a_l = self.A_log[...].astype(jnp.float32)  # [H]  'a', per key head (App. C.1)
+        q = q * (self.dk**-0.5)
 
-        f = self._split_qk(f_p + d_t, B, L)  # Proj_f(x)+δ -> [B,H,L,dk]
-        a = jnp.exp(a_l)[None, :, None, None]  # exp(a), broadcast over the d_k channels
-        g = -a * jax.nn.softplus(f)  # [B,H,L,dk] ≤ 0  (Eq. 86)
+        f_p = self.f_proj(x).astype(jnp.float32)
+        d_t = self.dt_bias[...].astype(jnp.float32)
+        a_l = self.A_log[...].astype(jnp.float32)
 
-        # Channel-wise gates (Eq. 11 / 85).
-        b = jax.nn.sigmoid(self.b_proj(x))  # b = σ(Proj_b x) ∈ [0,1]^{d_k}
+        f = self._split_qk(f_p + d_t, B, L)
+        a = jnp.exp(a_l)[None, :, None, None]
+        g = -a * jax.nn.softplus(f)
+
+        b = jax.nn.sigmoid(self.b_proj(x))
         b = self._split_qk(b, B, L)
 
         if self.expanded_erase:
-            b = 2.0 * b  # neg-eigenvalue variant: scale ONLY b to [0,2] (Sec. 3.1)
+            b = 2.0 * b
 
-        w = jax.nn.sigmoid(self.w_proj(x))  # w = σ(Proj_w x) ∈ [0,1]^{d_v}
+        w = jax.nn.sigmoid(self.w_proj(x))
         w = self._split_v(w, B, L)
 
         S0 = jnp.zeros((B, self.H, self.dk, self.group * self.dv), jnp.float32)
 
-        # Gated Delta Rule-2 chunkwise core (Eq. 10); forms cumsum γ internally (Eq. 30).
         o, S_final = chunkwise_gated_delta_rule_2(
             q,
             k,
@@ -310,18 +265,16 @@ class GatedDeltaNet2(nnx.Module):
         )
 
         B, _, L, _ = o.shape
-        o = o.swapaxes(1, 2).reshape(B, L, self.Hv, self.dv)  # ungroup value heads
-        o = self.o_norm(o, x).astype(
-            x.dtype
-        )  # low-rank SILU output gate computed inside, from x (see GatedRMSNorm)
+        o = o.swapaxes(1, 2).reshape(B, L, self.Hv, self.dv)
+        o = self.o_norm(o, x).astype(x.dtype)
 
-        out = self.o_proj(o)  # project back to d_model
+        out = self.o_proj(o)
 
         if return_state:
             B = S_final.shape[0]
             return out, (
                 S_final.reshape(B, self.H, self.dk, self.group, self.dv)
-                .swapaxes(2, 3)  # [B, H, G, dk, dv]
+                .swapaxes(2, 3)
                 .reshape(B, self.Hv, self.dk, self.dv)
             )
         return out
