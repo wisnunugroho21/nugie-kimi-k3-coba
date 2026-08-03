@@ -13,23 +13,16 @@ class TopKRouter(nnx.Module):
     ):
         self.num_experts = num_routed_experts
         self.top_k = top_k
-        # DeepSeek uses weight normalization on the router weights, but
-        # standard Linear without bias is functionally close enough.
-        self.gate = nnx.Linear(d_model, num_routed_experts, use_bias=False, rngs=rngs)
+
+        self.router = nnx.Linear(d_model, num_routed_experts, use_bias=False, rngs=rngs)
 
     def __call__(self, x: jax.Array):
-        logits = self.gate(x)
+        logits = self.router(x)
 
-        # 1. Softmax over ALL routed experts
         probs = jax.nn.softmax(logits, axis=-1)
-
-        # 2. Find Top-K indices
         _, top_k_indices = jax.lax.top_k(logits, k=self.top_k)
-
-        # 3. Gather the weights without renormalizing
         weights = jnp.take_along_axis(probs, top_k_indices, axis=-1)
 
-        # 4. Aux Loss Calculation (Switch Transformer style)
         top1_idx = top_k_indices[:, 0]
         mask_top1 = jax.nn.one_hot(top1_idx, self.num_experts)
 

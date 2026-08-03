@@ -221,8 +221,7 @@ class GatedDeltaNet2(nnx.Module):
         self,
         x: jax.Array,
         initial_state: jax.Array | None = None,
-        return_state: bool = False,
-    ) -> jax.Array | tuple[jax.Array, jax.Array]:
+    ) -> tuple[jax.Array, jax.Array]:
         B, L, _ = x.shape
 
         q = self.q_conv(self.q_proj(x))
@@ -295,11 +294,9 @@ class GatedDeltaNet2(nnx.Module):
 
         out = self.o_proj(o)
 
-        if return_state:
-            B = S_final.shape[0]
-            return out, (
-                S_final.reshape(B, self.H, self.dk, self.group, self.dv)
-                .swapaxes(2, 3)
-                .reshape(B, self.Hv, self.dk, self.dv)
-            )
-        return out
+        B = S_final.shape[0]
+        return out, (
+            S_final.reshape(B, self.H, self.dk, self.group, self.dv)
+            .swapaxes(2, 3)
+            .reshape(B, self.Hv, self.dk, self.dv)
+        )
